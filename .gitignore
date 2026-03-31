@@ -1,0 +1,11 @@
+# 数据和缓存
+data/
+processed/
+__pycache__/
+
+# 模型和实验记录
+weights/
+experiments/
+
+# 日志文件
+*.log
