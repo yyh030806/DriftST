@@ -3,47 +3,41 @@
 set -e
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
-DATA_DIR="/data/buyonggan/DriftST/data/HER2ST/visium_format"
-OUTPUT_DIR="/data/buyonggan/DriftST/processed/HER2ST"
+DATA_DIR="/data/buyonggan/DriftST/hest1k_datasets/her2st"
+OUTPUT_DIR="/data/buyonggan/DriftST/hest1k_datasets/her2st/processed_data"
 EXP_DIR="/data/buyonggan/DriftST/experiments/dit_$(date +%Y%m%d_%H%M%S)"
 CODE_DIR="$(cd "$(dirname "$0")" && pwd)"
+GENE_LIST="/data/buyonggan/DriftST/hest1k_datasets/her2st/processed_data/select_gene_list.txt"
 
 # ── 预处理超参 ────────────────────────────────────────────────────────────────
-N_HVG=200
-PATCH_SIZE=224
-NEIGHBOR_R=300
-MIN_GENES=200
-MIN_CELLS=10
+NEIGHBOR_R=150
 
 # ── 模型超参 ──────────────────────────────────────────────────────────────────
-HIDDEN_DIM=256       # DiT 隐层维度（原 MLP 是 768，DiT 参数量更多所以用 256）
-NUM_LAYERS=4         # DiT block 数量
-NUM_HEADS=8          # 注意力头数（需能整除 HIDDEN_DIM，256/8=32 ✓）
-DROPOUT=0.1          # DiT 用小 dropout（原 MLP 是 0.3）
+N_GENES=300
+HIDDEN_DIM=256
+NUM_LAYERS=4
+NUM_HEADS=8
+DROPOUT=0.1
 
 # ── 训练超参 ──────────────────────────────────────────────────────────────────
-BATCH_SIZE=64
-LR=1e-4
-WD=1e-4
-EPOCHS=100
+BATCH_SIZE=256
+LR=3e-4
+WD=1e-5
+EPOCHS=1000
 PATIENCE=20
-MAX_NEIGHBORS=6
-WARM_EPOCHS=10
+WARM_EPOCHS=0
 
 # ── Drift 超参 ────────────────────────────────────────────────────────────────
-GEN_PER_SPOT=4
+GEN_PER_SPOT=8         # K=16 dropout 采样
 R_LIST="0.02 0.05 0.2"
 DRIFT_STEP=1.0
-BANK_SAMPLE_SIZE=64
-DRIFT_WEIGHT=0.15    # 原来 0.05 太小，改为 0.15
-
-# ── 聚类超参（新增）──────────────────────────────────────────────────────────
-NUM_CLUSTERS=50      # K-Means 聚多少个簇
-SIZE_PER_CLUSTER=256 # 每个簇的 ring buffer 大小
+BANK_SIZE=4096         # ring buffer 总容量
+BANK_SAMPLE_SIZE=1024   # 每次从 bank 取 256 个负样本
+DRIFT_WEIGHT=0.15
 
 DEVICE="cuda"
-export CUDA_VISIBLE_DEVICES=0
-NUM_WORKERS=4
+export CUDA_VISIBLE_DEVICES=1
+NUM_WORKERS=16
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 SKIP_PREPROCESS=false
@@ -63,14 +57,11 @@ hr()  { echo "══════════════════════
 # ── Step 1: 预处理 ────────────────────────────────────────────────────────────
 if [ "$SKIP_PREPROCESS" = false ]; then
     hr; log "Step 1: 预处理"; hr
-    python "${CODE_DIR}/preprocess_all.py" \
+    python "${CODE_DIR}/preprocess_her2st.py" \
         --data_dir   "${DATA_DIR}"   \
         --output_dir "${OUTPUT_DIR}" \
-        --n_hvg      "${N_HVG}"      \
-        --patch_size "${PATCH_SIZE}" \
+        --gene_list  "${GENE_LIST}"  \
         --neighbor_r "${NEIGHBOR_R}" \
-        --min_genes  "${MIN_GENES}"  \
-        --min_cells  "${MIN_CELLS}"  \
         --batch_size "${BATCH_SIZE}" \
         --device     "${DEVICE}"
 else
@@ -106,19 +97,17 @@ import json; s=json.load(open('${OUTPUT_DIR}/splits.json')); print(s[${FOLD}]['t
         --data_dir           "${OUTPUT_DIR}"        \
         --fold               "${FOLD}"              \
         --output_dir         "${FOLD_DIR}"          \
-        --n_genes            "${N_HVG}"             \
+        --n_genes            "${N_GENES}"           \
         --hidden_dim         "${HIDDEN_DIM}"        \
         --num_layers         "${NUM_LAYERS}"        \
         --num_heads          "${NUM_HEADS}"         \
         --dropout            "${DROPOUT}"           \
-        --max_neighbors      "${MAX_NEIGHBORS}"     \
         --gen_per_spot       "${GEN_PER_SPOT}"      \
         --R_list             ${R_LIST}              \
         --drift_step         "${DRIFT_STEP}"        \
+        --bank_size          "${BANK_SIZE}"         \
         --bank_sample_size   "${BANK_SAMPLE_SIZE}"  \
         --drift_weight       "${DRIFT_WEIGHT}"      \
-        --num_clusters       "${NUM_CLUSTERS}"      \
-        --size_per_cluster   "${SIZE_PER_CLUSTER}"  \
         --warm_epochs        "${WARM_EPOCHS}"       \
         --epochs             "${EPOCHS}"            \
         --batch_size         "${BATCH_SIZE}"        \
@@ -135,7 +124,7 @@ done
 # ── Step 3: 汇总结果 ──────────────────────────────────────────────────────────
 hr; log "Step 3: 汇总结果"; hr
 
-python - <<PYEOF
+python - <<PYEOFcd
 import json, numpy as np, torch
 from pathlib import Path
 

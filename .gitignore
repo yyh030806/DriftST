@@ -9,3 +9,17 @@ experiments/
 
 # 日志文件
 *.log
+# 实验结果
+experiments/
+
+# 数据集
+hest1k_datasets/
+
+# 模型权重
+weights/
+
+# 数据文件
+*.npy
+*.pt
+*.tif
+*.h5ad
