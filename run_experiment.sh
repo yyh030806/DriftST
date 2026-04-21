@@ -21,23 +21,27 @@ DROPOUT=0.1
 
 # ── 训练超参 ──────────────────────────────────────────────────────────────────
 BATCH_SIZE=256
-LR=3e-4
-WD=1e-5
+LR=3e-5
+WD=1e-4
 EPOCHS=1000
+T_MAX=${EPOCHS} 
 PATIENCE=20
 WARM_EPOCHS=0
 
 # ── Drift 超参 ────────────────────────────────────────────────────────────────
-GEN_PER_SPOT=8         # K=16 dropout 采样
+GEN_PER_SPOT=8
 R_LIST="0.02 0.05 0.2"
 DRIFT_STEP=1.0
-BANK_SIZE=4096         # ring buffer 总容量
-BANK_SAMPLE_SIZE=1024   # 每次从 bank 取 256 个负样本
+BANK_SIZE=4096
+BANK_SAMPLE_SIZE=1024
 DRIFT_WEIGHT=0.15
 
 DEVICE="cuda"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=4
 NUM_WORKERS=16
+
+# ── wandb 设置 ────────────────────────────────────────────────────────────────
+WANDB_PROJECT="DriftST"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 SKIP_PREPROCESS=false
@@ -116,6 +120,8 @@ import json; s=json.load(open('${OUTPUT_DIR}/splits.json')); print(s[${FOLD}]['t
         --patience           "${PATIENCE}"          \
         --num_workers        "${NUM_WORKERS}"       \
         --device             "${DEVICE}"            \
+        --wandb_project      "${WANDB_PROJECT}"     \
+        --wandb_name         "fold${FOLD}-$(date +%m%d_%H%M)" \
         2>&1 | tee "${FOLD_DIR}/train.log"
 
     log "Fold ${FOLD} 完成 → ${FOLD_DIR}"
@@ -124,7 +130,7 @@ done
 # ── Step 3: 汇总结果 ──────────────────────────────────────────────────────────
 hr; log "Step 3: 汇总结果"; hr
 
-python - <<PYEOFcd
+python - <<PYEOF
 import json, numpy as np, torch
 from pathlib import Path
 
@@ -143,7 +149,7 @@ for fd in sorted(exp_dir.glob("fold_*")):
     print(f"  {fd.name} | slide={str(slide):6s} | PCC={pcc:.4f}")
 
 print("─" * 45)
-print(f"  Mean PCC = {np.nanmean(all_pcc):.4f} ± {np.nanstd(all_pcc):.4f}")
+print(f"  Mean PCC = {float(np.nanmean(all_pcc)):.4f} ± {float(np.nanstd(all_pcc)):.4f}")
 
 summary = {
     "mean_pcc": float(np.nanmean(all_pcc)),

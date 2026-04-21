@@ -6,6 +6,7 @@ DriftST 训练脚本
   2. 负样本 = dropout 预测存入 ring buffer，每次取 256 个
   3. 正样本 = 唯一匹配的真实基因值（LN后），shape (B, 1, D)
   4. K=16 次 dropout 采样；首次保留梯度，其余 detach 节省显存
+  5. [新增] wandb 记录 loss / PCC 曲线
 """
 import argparse
 from pathlib import Path
@@ -13,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from scipy.stats import pearsonr
 from torch.utils.data import DataLoader
 
@@ -72,8 +74,13 @@ def evaluate(model, loader, n_genes, device):
         if not np.isnan(pcc):
             pccs.append(pcc)
 
+    pred_mean = float(all_pred.mean())
+    pred_std  = float(all_pred.std())
+    true_mean = float(all_true.mean())
+    true_std  = float(all_true.std())
+
     if not pccs:
-        return 0.0
+        return 0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std
 
     pccs_sorted = sorted(pccs, reverse=True)
     pcc_10  = np.mean(pccs_sorted[:10])
@@ -82,7 +89,7 @@ def evaluate(model, loader, n_genes, device):
     pcc_all = np.mean(pccs)
     print(f"PCC-10={pcc_10:.4f} | PCC-50={pcc_50:.4f} | "
           f"PCC-200={pcc_200:.4f} | PCC-all={pcc_all:.4f}")
-    return pcc_all
+    return pcc_all, pcc_10, pcc_50, pcc_200, pred_mean, pred_std, true_mean, true_std
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,6 +164,7 @@ def main():
     p.add_argument("--dropout",          type=float, default=0.1)
 
     p.add_argument("--epochs",           type=int,   default=100)
+    p.add_argument("--t_max",            type=int,   default=None)
     p.add_argument("--batch_size",       type=int,   default=64)
     p.add_argument("--lr",               type=float, default=1e-4)
     p.add_argument("--wd",               type=float, default=1e-4)
@@ -170,7 +178,26 @@ def main():
     p.add_argument("--bank_size",        type=int,   default=8192)
     p.add_argument("--bank_sample_size", type=int,   default=256)
 
+    # ── wandb 相关参数 ──────────────────────────────────────
+    p.add_argument("--wandb_project",    type=str,   default="DriftST")
+    p.add_argument("--wandb_name",       type=str,   default=None,
+                   help="run 名称，默认为 fold-{fold}")
+    p.add_argument("--wandb_offline",    action="store_true",
+                   help="离线模式（服务器无网时使用）")
+
     args = p.parse_args()
+
+    # ── 初始化 wandb ────────────────────────────────────────
+    if args.wandb_offline:
+        import os
+        os.environ["WANDB_MODE"] = "offline"
+
+    run_name = args.wandb_name or f"fold-{args.fold}"
+    wandb.init(
+        project = args.wandb_project,
+        name    = run_name,
+        config  = vars(args),          # 自动记录所有超参数
+    )
 
     device  = torch.device(args.device)
     out_dir = Path(args.output_dir)
@@ -215,10 +242,12 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型参数量：{total_params / 1e6:.2f}M")
+    wandb.config.update({"total_params_M": total_params / 1e6}, allow_val_change=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    t_max = args.t_max if args.t_max is not None else args.epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-5,
+        optimizer, T_max=t_max, eta_min=1e-5,
     )
 
     bank = PredictionBank(
@@ -269,7 +298,7 @@ def main():
                 mse_loss = F.mse_loss(x0_k[:, 0, :], g_true)
 
                 # 正样本：唯一匹配，原始空间 (B, 1, D)
-                pos = g_true.detach().unsqueeze(1)
+                pos = g_true.detach().unsqueeze(1) 
 
                 # 负样本：从 bank 取 256 个原始预测，所有 batch element 共享
                 neg_bank = bank.sample(args.bank_sample_size, device)         # (256, D)
@@ -277,7 +306,7 @@ def main():
 
                 goal, goal_scaled, scale_inp = multi_scale_drift_step(
                     x      = x0_k,
-                    pos    = pos,
+                    pos    = pos,                       # (B, 1, D)，记得用 g_true.unsqueeze(1)
                     neg    = neg_bank,
                     R_list = tuple(args.R_list),
                     step   = args.drift_step,
@@ -307,18 +336,59 @@ def main():
         scheduler.step()
         n_batches   = len(train_loader)
         train_loss /= n_batches
-        val_pcc = evaluate(model, val_loader, n_genes, device)
+        current_lr  = scheduler.get_last_lr()[0]
+
+        # evaluate 返回 8 个指标
+        val_pcc, val_pcc10, val_pcc50, val_pcc200, \
+            pred_mean, pred_std, true_mean, true_std = evaluate(
+            model, val_loader, n_genes, device
+        )
 
         phase = "warm " if is_warmup else "drift"
         if is_warmup:
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} | "
-                  f"Val PCC: {val_pcc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                  f"Val PCC: {val_pcc:.4f} | LR: {current_lr:.2e}")
+
+            # ── wandb log（warmup 阶段）──────────────────────
+            wandb.log({
+                "epoch":           epoch,
+                "phase":           0,                   # 0=warmup, 1=drift（方便过滤）
+                "train/loss":      train_loss,
+                "val/pcc_all":     val_pcc,
+                "val/pcc_10":      val_pcc10,
+                "val/pcc_50":      val_pcc50,
+                "val/pcc_200":     val_pcc200,
+                "train/lr":        current_lr,
+                "diag/pred_mean":  pred_mean,
+                "diag/pred_std":   pred_std,
+                "diag/true_mean":  true_mean,
+                "diag/true_std":   true_std,
+            }, step=epoch)
+
         else:
             d_avg = drift_loss_acc / n_batches
             m_avg = mse_loss_acc   / n_batches
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} "
                   f"(drift={d_avg:.4f} mse={m_avg:.4f}) | "
-                  f"Val PCC: {val_pcc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                  f"Val PCC: {val_pcc:.4f} | LR: {current_lr:.2e}")
+
+            # ── wandb log（drift 阶段）───────────────────────
+            wandb.log({
+                "epoch":            epoch,
+                "phase":            1,
+                "train/loss":       train_loss,
+                "train/drift_loss": d_avg,
+                "train/mse_loss":   m_avg,
+                "val/pcc_all":      val_pcc,
+                "val/pcc_10":       val_pcc10,
+                "val/pcc_50":       val_pcc50,
+                "val/pcc_200":      val_pcc200,
+                "train/lr":         current_lr,
+                "diag/pred_mean":   pred_mean,
+                "diag/pred_std":    pred_std,
+                "diag/true_mean":   true_mean,
+                "diag/true_std":    true_std,
+            }, step=epoch)
 
         if val_pcc > best_pcc:
             best_pcc   = val_pcc
@@ -331,8 +401,13 @@ def main():
                 "gene_order": gene_order,
                 "args":       vars(args),
             }, out_dir / "best_model.pt")
-            
+
+            # 在 wandb 里标记最佳 checkpoint
+            wandb.run.summary["best_val_pcc"]   = best_pcc
+            wandb.run.summary["best_epoch"]      = epoch
+
     print(f"Fold {args.fold} 训练结束，最佳 PCC: {best_pcc:.4f}")
+    wandb.finish()
 
 
 if __name__ == "__main__":

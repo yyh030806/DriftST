@@ -1,85 +1,102 @@
 """
-DriftST — Drift Step
+DriftST — Drift Step（split form 版）
 
-变更：
-  - 删除 ClusterAwareBank，改为单纯的 PredictionBank（ring buffer，无聚类）
-  - multi_scale_drift_step 新增 neg 参数（从 bank 取出的外部负样本）
-  - 正样本 pos 形状为 (B, 1, D)（唯一匹配）
+设计：
+  1. pos / neg 分开 softmax（split form，Kaiming 论文附录 ablation 变体）
+     - 避免 N_pos=1 被 N_neg=264 淹没
+     - N_pos=1 时 A_pos ≡ 1，drift_pos 直接等于 pos（真值）
+  2. 温度归一化对齐论文：scale = mean(dist) / sqrt(D)
+  3. drift 公式：V = drift_pos - drift_neg
+  4. 多尺度平均（不在循环内 unit-norm，让 loss 有信息量）
+  5. PredictionBank 不变
 """
 import torch
 import torch.nn.functional as F
+import math
 
 
 def multi_scale_drift_step(
-    x:      torch.Tensor,           # (B, K, D)      当前 dropout 预测，有梯度
-    pos:    torch.Tensor,           # (B, 1, D)      detach，真实基因值（唯一匹配）
-    neg:    torch.Tensor = None,    # (B, N_bank, D) detach，从 bank 取出的负样本
-    R_list: tuple = (0.02, 0.05, 0.2),
-    step:   float = 1.0,
-) -> tuple:
+    x, pos, neg=None,
+    R_list=(0.02, 0.05, 0.2),
+    step=1.0,
+):
+    """
+    x:   (B, K, D)  当前 dropout 预测
+    pos: (B, N_pos, D)  正样本（通常 N_pos=1）
+    neg: (B, N_bank, D) 或 None  外部负样本
+
+    返回:
+      goal:        (B, K, D) detach
+      goal_scaled: (B, K, D) detach（loss 用）
+      scale_inp:   scalar detach
+    """
     B, K, D = x.shape
-    C_p     = pos.shape[1]          # 始终为 1
-    old_x   = x.detach()           # (B, K, D)
+    old_x = x.detach()
 
-    # ── 构建完整负样本集合 ────────────────────────────────────────────────────
-    # 当前 K 个预测（互相排斥）+ 从 bank 取出的 N_bank 个
+    # 负样本池：[batch内K个dropout预测, bank外部负样本]
     if neg is not None:
-        all_neg = torch.cat([old_x, neg], dim=1)  # (B, K+N_bank, D)
+        all_neg = torch.cat([old_x, neg], dim=1)   # (B, K + N_bank, D)
     else:
-        all_neg = old_x                           # (B, K, D)
+        all_neg = old_x                            # (B, K, D)
     N_neg = all_neg.shape[1]
-
-    # targets = [all_neg | pos]
-    targets   = torch.cat([all_neg, pos], dim=1)  # (B, N_neg+1, D)
-    split_pos = N_neg                             # pos 从此索引开始
-
-    w    = torch.ones(N_neg + C_p, device=x.device)
-    w_2d = w.unsqueeze(0).expand(B, -1)          # (B, N_neg+C_p)
+    N_pos = pos.shape[1]
 
     with torch.no_grad():
-        # dist: (B, K, N_neg+C_p)
-        diff_all = targets.unsqueeze(1) - old_x.unsqueeze(2)  # (B, K, N_neg+C_p, D)
-        dist     = diff_all.norm(dim=-1)                       # (B, K, N_neg+C_p)
+        # ─── 距离 ────────────────────────────────────────────
+        # 对 neg 和 pos 分别算距离
+        diff_neg = all_neg.unsqueeze(1) - old_x.unsqueeze(2)   # (B, K, N_neg, D)
+        diff_pos = pos.unsqueeze(1)     - old_x.unsqueeze(2)   # (B, K, N_pos, D)
 
-        weighted_dist = dist * w_2d.unsqueeze(1)
-        scale         = weighted_dist.mean() / w_2d.mean()
-        scale_inp     = (scale / (D ** 0.5)).clamp(min=1e-3)
+        dist_neg = diff_neg.norm(dim=-1)    # (B, K, N_neg)
+        dist_pos = diff_pos.norm(dim=-1)    # (B, K, N_pos)
 
-        old_x_sc    = old_x   / scale_inp
-        targets_sc  = targets / scale_inp
-        dist_normed = dist    / scale.clamp(min=1e-3)
+        # ─── 特征归一化 S（对齐论文 Eq. 20-21）────────────────
+        # scale 用所有距离的均值除以 sqrt(D)，让 dist_normed mean ≈ sqrt(D)
+        all_dist_mean = (dist_neg.sum() + dist_pos.sum()) / (dist_neg.numel() + dist_pos.numel())
+        scale = (all_dist_mean / math.sqrt(float(D))).clamp(min=1e-6)
+        scale_inp = scale
 
-        # self-mask：只对前 K 个当前预测生效（bank 样本不需要 self-mask）
-        diag_mask = torch.zeros(K, N_neg + C_p, device=x.device)
-        diag_mask[:, :K] = torch.eye(K, device=x.device) * 100.0
-        dist_normed = dist_normed + diag_mask.unsqueeze(0)
+        old_x_sc  = old_x  / scale_inp
+        pos_sc    = pos    / scale_inp
+        all_neg_sc = all_neg / scale_inp
 
-        force_across_R = torch.zeros_like(old_x_sc)
+        dist_neg_normed = dist_neg / scale_inp    # mean ≈ sqrt(D)
+        dist_pos_normed = dist_pos / scale_inp
+
+        # 自身对角 mask：前 K 列是 batch 内 K 个 dropout 预测，query i 不要把自己当 neg
+        diag_mask = torch.zeros(K, N_neg, device=x.device, dtype=dist_neg_normed.dtype)
+        diag_mask[:, :K] = torch.eye(K, device=x.device, dtype=dist_neg_normed.dtype) * 1e6
+        dist_neg_normed = dist_neg_normed + diag_mask.unsqueeze(0)
+
+        # ─── 多尺度 drift 累积 ─────────────────────────────────
+        v_agg = torch.zeros_like(old_x_sc)
 
         for R in R_list:
-            logits   = -dist_normed / R
-            aff_row  = F.softmax(logits, dim=-1)
-            aff_col  = F.softmax(logits, dim=-2)
-            affinity = (aff_row * aff_col).clamp(min=1e-6).sqrt()
-            affinity = affinity * w_2d.unsqueeze(1)
+            # 论文 Eq. 22: ρ̃ = ρ · sqrt(D)
+            temp_eff = R * math.sqrt(float(D))
 
-            aff_neg = affinity[:, :, :split_pos]   # (B, K, N_neg)
-            aff_pos = affinity[:, :, split_pos:]   # (B, K, 1)
+            # pos 内部 softmax（N_pos=1 时恒为 1）
+            logits_pos = -dist_pos_normed / temp_eff        # (B, K, N_pos)
+            A_pos = F.softmax(logits_pos, dim=-1)           # (B, K, N_pos)
 
-            sum_pos     = aff_pos.sum(-1, keepdim=True)
-            sum_neg     = aff_neg.sum(-1, keepdim=True)
-            r_coeff_neg = -aff_neg * sum_pos
-            r_coeff_pos =  aff_pos * sum_neg
-            R_coeff     = torch.cat([r_coeff_neg, r_coeff_pos], dim=-1)
+            # neg 内部 softmax
+            logits_neg = -dist_neg_normed / temp_eff        # (B, K, N_neg)
+            A_neg = F.softmax(logits_neg, dim=-1)           # (B, K, N_neg)
 
-            total_force  = torch.einsum('bkn,bnd->bkd', R_coeff, targets_sc)
-            total_coeffs = R_coeff.sum(-1, keepdim=True)
-            total_force  = total_force - total_coeffs * old_x_sc
+            # V_R = drift_pos - drift_neg
+            # drift_pos: query 想靠近的方向（N_pos=1 时就是 pos 本身）
+            # drift_neg: query 最像的负样本方向（要推开的）
+            drift_pos = torch.einsum('bkn,bnd->bkd', A_pos, pos_sc)
+            drift_neg = torch.einsum('bkn,bnd->bkd', A_neg, all_neg_sc)
 
-            f_norm         = (total_force ** 2).mean().clamp(min=1e-8).sqrt()
-            force_across_R = force_across_R + total_force / f_norm
+            v_R = drift_pos - drift_neg
 
-        goal_scaled = old_x_sc + step * force_across_R
+            v_agg = v_agg + v_R
+
+        # 多尺度平均
+        force = v_agg / float(len(R_list))
+
+        goal_scaled = old_x_sc + step * force
         goal        = goal_scaled * scale_inp
 
     return goal.detach(), goal_scaled.detach(), scale_inp.detach()
@@ -96,16 +113,12 @@ def drift_loss_fn(
 
 # ─────────────────────────────────────────────────────────────
 # PredictionBank：单纯 ring buffer，无聚类
-# 存储 dropout 预测值，作为负样本 bank
 # ─────────────────────────────────────────────────────────────
 
 class PredictionBank:
     """
     单纯 ring buffer。
     存储 dropout 预测值（LN 后），对外提供负样本。
-
-    enqueue：接收 (N, D) 张量，循环覆盖写入
-    sample ：随机取 n 个，返回 (n, D)
     """
 
     def __init__(self, size: int = 8192, feat_dim: int = 300):
@@ -117,10 +130,6 @@ class PredictionBank:
 
     @torch.no_grad()
     def enqueue(self, feat: torch.Tensor):
-        """
-        feat: (N, D)，调用前请确保已 detach
-        包含 wrap-around 处理
-        """
         feat = feat.detach().cpu().float()
         N    = feat.shape[0]
         end  = self.ptr + N
@@ -136,10 +145,6 @@ class PredictionBank:
         self.count = min(self.count + N, self.size)
 
     def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """
-        随机取 n 个样本
-        返回：(n, D)，detach 张量
-        """
         valid = min(self.count, self.size)
         if valid == 0:
             return torch.zeros(n, self.feat_dim, device=device)

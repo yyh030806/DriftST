@@ -11,6 +11,7 @@ experiments/
 *.log
 # 实验结果
 experiments/
+wandb/
 
 # 数据集
 hest1k_datasets/
