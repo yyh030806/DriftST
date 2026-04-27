@@ -80,16 +80,19 @@ def evaluate(model, loader, n_genes, device):
     true_std  = float(all_true.std())
 
     if not pccs:
-        return 0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std
+        return 0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std, 0.0, 0.0
 
     pccs_sorted = sorted(pccs, reverse=True)
     pcc_10  = np.mean(pccs_sorted[:10])
     pcc_50  = np.mean(pccs_sorted[:min(50,  len(pccs_sorted))])
     pcc_200 = np.mean(pccs_sorted[:min(200, len(pccs_sorted))])
     pcc_all = np.mean(pccs)
+    ln2 = np.log(2)
+    mse_log2 = float(np.mean(((all_pred - all_true) / ln2) ** 2))
+    mae_log2 = float(np.mean(np.abs((all_pred - all_true) / ln2)))
     print(f"PCC-10={pcc_10:.4f} | PCC-50={pcc_50:.4f} | "
           f"PCC-200={pcc_200:.4f} | PCC-all={pcc_all:.4f}")
-    return pcc_all, pcc_10, pcc_50, pcc_200, pred_mean, pred_std, true_mean, true_std
+    return pcc_all, pcc_10, pcc_50, pcc_200, pred_mean, pred_std, true_mean, true_std, mse_log2, mae_log2
 
 
 # ─────────────────────────────────────────────────────────────
@@ -162,6 +165,8 @@ def main():
     p.add_argument("--num_layers",       type=int,   default=4)
     p.add_argument("--num_heads",        type=int,   default=8)
     p.add_argument("--dropout",          type=float, default=0.1)
+    p.add_argument("--d_emb",            type=int,   default=64,
+                   help="Gene embedding 维度")
 
     p.add_argument("--epochs",           type=int,   default=100)
     p.add_argument("--t_max",            type=int,   default=None)
@@ -237,6 +242,7 @@ def main():
         num_heads  = args.num_heads,
         output_dim = n_genes,
         dropout    = args.dropout,
+        d_emb      = args.d_emb,
         gene_order = gene_order,
     ).to(device)
 
@@ -340,10 +346,10 @@ def main():
 
         # evaluate 返回 8 个指标
         val_pcc, val_pcc10, val_pcc50, val_pcc200, \
-            pred_mean, pred_std, true_mean, true_std = evaluate(
+            pred_mean, pred_std, true_mean, true_std, val_mse, val_mae = evaluate(
             model, val_loader, n_genes, device
         )
-
+        
         phase = "warm " if is_warmup else "drift"
         if is_warmup:
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} | "
@@ -363,6 +369,8 @@ def main():
                 "diag/pred_std":   pred_std,
                 "diag/true_mean":  true_mean,
                 "diag/true_std":   true_std,
+                "val/mse_log2":    val_mse,
+                "val/mae_log2":    val_mae,
             }, step=epoch)
 
         else:
@@ -370,7 +378,7 @@ def main():
             m_avg = mse_loss_acc   / n_batches
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} "
                   f"(drift={d_avg:.4f} mse={m_avg:.4f}) | "
-                  f"Val PCC: {val_pcc:.4f} | LR: {current_lr:.2e}")
+                  f"Val PCC: {val_pcc:.4f} | MSE={val_mse:.4f} MAE={val_mae:.4f} | LR: {current_lr:.2e}")
 
             # ── wandb log（drift 阶段）───────────────────────
             wandb.log({
@@ -388,6 +396,8 @@ def main():
                 "diag/pred_std":    pred_std,
                 "diag/true_mean":   true_mean,
                 "diag/true_std":    true_std,
+                "val/mse_log2":    val_mse,
+                "val/mae_log2":    val_mae,
             }, step=epoch)
 
         if val_pcc > best_pcc:
