@@ -29,6 +29,8 @@ def parse_args():
     p.add_argument("--device",       type=str, default="cuda")
     p.add_argument("--num_workers",  type=int, default=4)
     p.add_argument("--batch_size",   type=int, default=256)
+    p.add_argument("--save_h5ad",    type=str, default=None,
+                   help="导出 AnnData：X=pred, layers['gt']=gt, obsm['spatial']=坐标")
 
     # ─── 必须与训练一致的模型结构超参 ───
     p.add_argument("--input_dim",    type=int,   default=2048)
@@ -103,7 +105,41 @@ def main():
 
     # ── 评估 ─────────────────────────────────────────────────
     print(f"\n{'='*60}\nfold {args.fold} 评估\n{'='*60}")
-    evaluate(model, val_loader, n_genes, device, svg_indices=svg_indices)
+    results = evaluate(model, val_loader, n_genes, device,
+                       svg_indices=svg_indices,
+                       return_predictions=bool(args.save_h5ad))
+
+    # ── 可选导出 h5ad ────────────────────────────────────────
+    if args.save_h5ad:
+        import anndata as ad
+        import pandas as pd
+        all_pred, all_true = results[-2], results[-1]
+
+        # gene 名 + barcode + 空间坐标
+        gene_names = json.load(open(Path(args.data_dir) / "gene_names.json"))[:n_genes]
+        barcodes   = val_ds.barcodes
+        obs_meta   = pd.read_csv(Path(args.data_dir) / "obs_metadata.csv", index_col=0)
+        obs_sub    = obs_meta.loc[barcodes].copy()
+
+        # 兼容 pixel_x/pixel_y 或 x/y
+        xcol = "pixel_x" if "pixel_x" in obs_sub.columns else "x"
+        ycol = "pixel_y" if "pixel_y" in obs_sub.columns else "y"
+        spatial = obs_sub[[xcol, ycol]].to_numpy()
+
+        adata = ad.AnnData(
+            X     = all_pred.astype("float32"),
+            obs   = obs_sub,
+            var   = pd.DataFrame(index=gene_names),
+            obsm  = {"spatial": spatial},
+            layers= {"gt": all_true.astype("float32")},
+        )
+        adata.uns["fold"] = args.fold
+        adata.uns["note"] = "X = predicted ln(x+1) expression; layers['gt'] = ground truth ln(x+1)"
+
+        out_path = Path(args.save_h5ad)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        adata.write_h5ad(out_path)
+        print(f"已导出 → {out_path}  shape={adata.shape}")
 
 
 if __name__ == "__main__":

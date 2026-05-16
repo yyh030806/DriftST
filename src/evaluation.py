@@ -5,10 +5,11 @@ from scipy.stats import pearsonr
 
 
 @torch.no_grad()
-def evaluate(model, loader, n_genes, device, svg_indices=None):
+def evaluate(model, loader, n_genes, device, svg_indices=None, return_predictions=False):
     """
     svg_indices: list of gene indices sorted by Moran's I (descending).
                  If provided, reports PCC for top-20 and top-50 SVGs.
+    return_predictions: 若 True，额外返回 (all_pred, all_true) numpy 数组。
     """
     model.eval()
     all_pred, all_true = [], []
@@ -40,7 +41,8 @@ def evaluate(model, loader, n_genes, device, svg_indices=None):
     true_std  = float(all_true.std())
 
     if not any(p != 0.0 for p in gene_pccs):
-        return 0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std, 0.0, 0.0, 0.0, 0.0
+        result = (0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std, 0.0, 0.0, 0.0, 0.0)
+        return (*result, all_pred, all_true) if return_predictions else result
 
     pccs_sorted = sorted(gene_pccs, reverse=True)
     pcc_10  = np.mean(pccs_sorted[:10])
@@ -61,6 +63,7 @@ def evaluate(model, loader, n_genes, device, svg_indices=None):
     print(f"PCC-10={pcc_10:.4f} | PCC-50={pcc_50:.4f} | "
           f"PCC-200={pcc_200:.4f} | PCC-all={pcc_all:.4f} | "
           f"SVG-20={svg_pcc20:.4f} | SVG-50={svg_pcc50:.4f}")
-    return (pcc_all, pcc_10, pcc_50, pcc_200,
-            pred_mean, pred_std, true_mean, true_std,
-            mse_log2, mae_log2, svg_pcc20, svg_pcc50)
+    result = (pcc_all, pcc_10, pcc_50, pcc_200,
+              pred_mean, pred_std, true_mean, true_std,
+              mse_log2, mae_log2, svg_pcc20, svg_pcc50)
+    return (*result, all_pred, all_true) if return_predictions else result
