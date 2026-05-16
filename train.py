@@ -24,26 +24,6 @@ from src.model import GenePredictor
 from src.evaluation import evaluate
 
 
-# ─────────────────────────────────────────────────────────────
-# 基因聚类排列
-# ─────────────────────────────────────────────────────────────
-
-def compute_gene_order(dataset, n_genes: int) -> list:
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    from scipy.spatial.distance import pdist
-
-    print("预计算基因聚类排列...")
-    # 直接读常驻内存的 gene_expr，避开 DataLoader 多余的邻居 mmap 读
-    exprs = dataset.gene_expr.numpy() if hasattr(dataset.gene_expr, "numpy") else np.asarray(dataset.gene_expr)
-
-    corr_dist  = pdist(exprs.T, metric="correlation")
-    corr_dist  = np.nan_to_num(corr_dist, nan=2.0, posinf=2.0, neginf=0.0)
-    Z          = linkage(corr_dist, method="ward")
-    gene_order = leaves_list(Z).tolist()
-    print(f"基因聚类完成，共 {n_genes} 个基因")
-    return gene_order
-
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -227,8 +207,6 @@ def main():
         num_workers=args.num_workers,
     )
 
-    gene_order = compute_gene_order(raw_train_ds, n_genes)
-
     model = GenePredictor(
         input_dim    = args.input_dim,
         hidden_dim   = args.hidden_dim,
@@ -237,7 +215,6 @@ def main():
         output_dim   = n_genes,
         dropout      = args.dropout,
         n_attn_layers = args.n_attn_layers,
-        gene_order   = gene_order,
         use_gate     = args.use_gate,
         gate_target_fractions = args.gate_targets,
         gate_entropy_weight   = args.gate_entropy_weight,
@@ -445,7 +422,6 @@ def main():
                 "val_pcc":    best_pcc,
                 "fold":       args.fold,
                 "test_slide": test_slide,
-                "gene_order": gene_order,
                 "args":       vars(args),
             }, out_dir / "best_model.pt")
 

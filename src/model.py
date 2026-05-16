@@ -321,7 +321,6 @@ class GenePredictor(nn.Module):
         use_neighbor:    bool  = False,
         max_neighbors:   int   = 6,
         n_attn_layers:   int   = 2,
-        gene_order       = None,
         use_gate:        bool  = True,
         gate_target_fractions: list = None,
         gate_entropy_weight: float = 0.1,
@@ -333,13 +332,6 @@ class GenePredictor(nn.Module):
         self.use_gate      = use_gate
         self.gate_target_fractions = gate_target_fractions
         self.gate_entropy_weight   = gate_entropy_weight
-
-        # ── 基因重排序 ────────────────────────────────────────
-        if gene_order is None:
-            gene_order = list(range(output_dim))
-        _order = torch.tensor(gene_order, dtype=torch.long)
-        self.register_buffer("gene_order",     _order)
-        self.register_buffer("gene_order_inv", torch.argsort(_order))
 
         # ── 生物学先验矩阵 ───────────────────────────────────
         # 全局基因共表达矩阵（从训练集表达矩阵自身计算）
@@ -470,7 +462,6 @@ class GenePredictor(nn.Module):
 
         # ── Output ───────────────────────────────────────────
         x0 = self.head(self.out_norm(gene_tokens)).squeeze(-1)
-        x0 = x0[:, self.gene_order_inv]
 
         # ── model_out：gate 信息打包 ────────────────────────
         model_out = {}

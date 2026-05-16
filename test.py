@@ -69,16 +69,6 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── 基因顺序（与训练一致：层次聚类得到）─────────────────
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    from scipy.spatial.distance import pdist
-    print("重建基因聚类排列（与训练时算法一致）...")
-    exprs = raw_train_ds.gene_expr.numpy()
-    corr_dist = pdist(exprs.T, metric="correlation")
-    corr_dist = np.nan_to_num(corr_dist, nan=2.0, posinf=2.0, neginf=0.0)
-    Z = linkage(corr_dist, method="ward")
-    gene_order = leaves_list(Z).tolist()
-
     # ── 模型 ─────────────────────────────────────────────────
     model = GenePredictor(
         input_dim    = args.input_dim,
@@ -88,7 +78,6 @@ def main():
         output_dim   = n_genes,
         dropout      = args.dropout,
         n_attn_layers = args.n_attn_layers,
-        gene_order   = gene_order,
         use_gate     = args.use_gate,
         gate_target_fractions = args.gate_targets,
         gate_entropy_weight   = args.gate_entropy_weight,
@@ -97,6 +86,7 @@ def main():
     ).to(device)
 
     # 训练时 load 的共表达矩阵需要重建（结构里有 bio_bias buffer）
+    exprs = raw_train_ds.gene_expr.numpy()
     R = np.corrcoef(exprs.T)
     R = np.nan_to_num(R, nan=0.0)
     model.load_bio_bias(R)
