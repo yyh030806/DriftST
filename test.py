@@ -103,6 +103,17 @@ def main():
     if unexpected:
         print(f"[warn] unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
+    # ── Legacy: 老 ckpt 含 gene_order，自动补回输出置换 ─────────
+    legacy_order = ckpt.get("gene_order")
+    if legacy_order is not None and legacy_order != list(range(n_genes)):
+        legacy_inv = torch.argsort(torch.tensor(legacy_order, dtype=torch.long)).to(device)
+        original_forward = model.forward
+        def legacy_forward(*a, **kw):
+            x0, info = original_forward(*a, **kw)
+            return x0[:, legacy_inv], info
+        model.forward = legacy_forward
+        print(f"[legacy] 检测到老 ckpt 的 gene_order，已在输出端自动应用置换")
+
     # ── 评估 ─────────────────────────────────────────────────
     print(f"\n{'='*60}\nfold {args.fold} 评估\n{'='*60}")
     results = evaluate(model, val_loader, n_genes, device,
