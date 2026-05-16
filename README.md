@@ -18,27 +18,35 @@ DriftST/
 │   ├── generate_xenium_5fold_splits.py
 │   └── select_xenium_genes.py
 └── scripts/                  # 一键运行脚本
-    ├── run_xenium.sh
-    ├── run_preprocess.sh
-    └── run_experiment.sh
+    ├── run_xenium.sh         # Xenium 单切片 5-fold 训练
+    ├── run_preprocess.sh     # Xenium 预处理
+    └── run_experiment.sh     # her2st / prad / kidney 预处理 + 训练
 ```
 
 ## 用法
 
-### 预处理
+### Xenium（单切片空间 5-fold）
+
 ```bash
+# 1. 预处理
 bash scripts/run_preprocess.sh
-```
 
-### 训练（Xenium 5-fold）
-```bash
+# 2. 训练
 bash scripts/run_xenium.sh --folds 0
-```
 
-### 评估
-```bash
+# 3. 评估
 python test.py \
     --data_dir hest1k_datasets/xenium_janesick/processed_data \
     --fold 0 \
     --ckpt experiments/xenium_xxxx/fold_0/best_model.pt
 ```
+
+### her2st / PRAD / kidney（leave-one-slide-out）
+
+```bash
+bash scripts/run_experiment.sh --dataset her2st --fold 0
+bash scripts/run_experiment.sh --dataset prad   --fold 0
+bash scripts/run_experiment.sh --dataset kidney --fold 0
+```
+
+`run_experiment.sh` 一条命令包含预处理 + 训练；若已预处理可加 `--skip-preprocess`。
