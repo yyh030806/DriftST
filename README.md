@@ -32,7 +32,7 @@ bash scripts/run_preprocess.sh
 
 ### 训练（Xenium 5-fold）
 ```bash
-bash scripts/run_xenium.sh --folds 0 --use-neighbor
+bash scripts/run_xenium.sh --folds 0
 ```
 
 ### 评估
@@ -40,6 +40,5 @@ bash scripts/run_xenium.sh --folds 0 --use-neighbor
 python test.py \
     --data_dir hest1k_datasets/xenium_janesick/processed_data \
     --fold 0 \
-    --ckpt experiments/xenium_xxxx/fold_0/best.pt \
-    --use_neighbor
+    --ckpt experiments/xenium_xxxx/fold_0/best_model.pt
 ```
