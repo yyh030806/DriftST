@@ -1,0 +1,201 @@
+"""
+dataset.py
+
+支持图像增强：
+  z_img_features.npy 可以是 (N, D) 或 (N, n_versions, D)
+  - 2D: 旧格式，直接使用
+  - 3D: 增强格式，index 0 = 原始，index 1.. = 增强版本
+        训练时随机选一个版本，评估时用 index 0（原始）
+"""
+
+import json
+import random
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+
+
+class SpatialDataset(Dataset):
+    """
+    Single-split (train or test) spatial transcriptomics dataset.
+
+    Args:
+        data_dir      : directory produced by preprocess.py
+        barcodes      : spot barcodes belonging to this split
+        max_neighbors : maximum 1-hop neighbors to return (Visium: up to 6)
+        is_train      : True = 训练集（随机选增强版本），False = 测试集（只用原始）
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        barcodes: list[str],
+        max_neighbors: int = 6,
+        is_train: bool = True,
+    ):
+        self.data_dir      = Path(data_dir)
+        self.max_neighbors = max_neighbors
+        self.is_train      = is_train
+
+        # ── 全量数组：mmap 加载 ──────────────────────────────────────────────
+        gene_mat  = np.load(self.data_dir / "gene_expression.npy", mmap_mode='r')  # (N, G)
+        z_img_raw = np.load(self.data_dir / "z_img_features.npy",  mmap_mode='r')
+
+        # 检测特征格式：2D (N, D) 或 3D (N, n_versions, D)
+        if z_img_raw.ndim == 3:
+            self.n_versions = z_img_raw.shape[1]   # 1 + n_aug
+            self.feat_dim   = z_img_raw.shape[2]
+            self.has_aug    = True
+        else:
+            self.n_versions = 1
+            self.feat_dim   = z_img_raw.shape[1]
+            self.has_aug    = False
+
+        with open(self.data_dir / "barcodes.json") as f:
+            all_barcodes: list[str] = json.load(f)
+        with open(self.data_dir / "neighbor_map.json") as f:
+            neighbor_map: dict[str, list[str]] = json.load(f)
+
+        bc2idx = {bc: i for i, bc in enumerate(all_barcodes)}
+
+        # ── 过滤当前 split 的 barcode ────────────────────────────────────────
+        valid_bcs = [bc for bc in barcodes if bc in bc2idx]
+        idxs      = [bc2idx[bc] for bc in valid_bcs]
+
+        self.barcodes  = valid_bcs
+        self.n_spots   = len(valid_bcs)
+        self.n_genes   = gene_mat.shape[1]
+
+        # 基因表达（log1p 归一化，常驻内存）
+        self.gene_expr = torch.log1p(
+            torch.tensor(gene_mat[idxs], dtype=torch.float32)
+        )  # (N_split, G)
+
+        # 图像特征（常驻内存）
+        if self.has_aug:
+            # 3D: (N_split, n_versions, D)
+            self.z_img = torch.tensor(
+                z_img_raw[idxs], dtype=torch.float32
+            )  # (N_split, n_versions, D)
+        else:
+            # 2D: (N_split, D) → 兼容旧格式
+            self.z_img = torch.tensor(
+                z_img_raw[idxs], dtype=torch.float32
+            )  # (N_split, D)
+
+        # 全量数组保留引用，供邻居索引用（mmap，不复制）
+        self._all_zimg = z_img_raw
+
+        # slide_id
+        self.slide_ids = self._parse_slide_ids(valid_bcs, self.data_dir)
+
+        # ── 预计算邻居索引矩阵 ────────────────────────────────────────────────
+        K = max_neighbors
+        self.neighbor_idxs = torch.full(
+            (self.n_spots, K), fill_value=-1, dtype=torch.long
+        )
+        for i, bc in enumerate(valid_bcs):
+            nbs = neighbor_map.get(bc, [])
+            for k, nbc in enumerate(nbs[:K]):
+                if nbc in bc2idx:
+                    self.neighbor_idxs[i, k] = bc2idx[nbc]
+
+    # ── 辅助：解析 slide_id ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_slide_ids(barcodes: list[str], data_dir: Path) -> list[str]:
+        summary_path = data_dir / "summary.json"
+        if summary_path.exists():
+            with open(summary_path) as f:
+                summary = json.load(f)
+            bc2slide = summary.get("bc2slide", {})
+            if bc2slide:
+                return [bc2slide.get(bc, "unknown") for bc in barcodes]
+
+        slide_ids = []
+        for bc in barcodes:
+            parts = bc.split("_", 1)
+            slide_ids.append(parts[0] if len(parts) == 2 else "unknown")
+        return slide_ids
+
+    # ── Dataset 接口 ──────────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return self.n_spots
+
+    def __getitem__(self, idx: int) -> dict:
+        gene_expr = self.gene_expr[idx]   # (G,)
+
+        # ── 图像特征：训练时随机选增强版本，评估时用原始 ──
+        if self.has_aug:
+            if self.is_train:
+                aug_idx = random.randint(0, self.n_versions - 1)
+            else:
+                aug_idx = 0  # 评估时只用原始
+            z_img = self.z_img[idx, aug_idx]    # (D,)
+        else:
+            z_img = self.z_img[idx]             # (D,) 旧格式兼容
+
+        K = self.max_neighbors
+        D = self.feat_dim
+
+        # 邻居
+        nidxs = self.neighbor_idxs[idx]
+        valid = nidxs >= 0
+
+        neighbor_zimg = torch.zeros(K, D, dtype=torch.float32)
+
+        if valid.any():
+            valid_nidxs = nidxs[valid].numpy()
+            # 邻居特征：训练时随机选增强版本，评估时用原始
+            if self.has_aug:
+                nb_aug_idx = aug_idx if self.is_train else 0
+                neighbor_zimg[valid] = torch.tensor(
+                    self._all_zimg[valid_nidxs, nb_aug_idx], dtype=torch.float32
+                )
+            else:
+                neighbor_zimg[valid] = torch.tensor(
+                    self._all_zimg[valid_nidxs], dtype=torch.float32
+                )
+
+        return {
+            "z_img":            z_img,
+            "gene_expr":        gene_expr,
+            "neighbor_zimg":    neighbor_zimg,
+            "neighbor_valid":   valid,
+            "slide_id":         self.slide_ids[idx],
+            "barcode":          self.barcodes[idx],
+        }
+
+
+# ── 构建 train/test split ─────────────────────────────────────────────────────
+
+def build_datasets(
+    data_dir:      str,
+    fold:          int = 0,
+    max_neighbors: int = 6,
+) -> tuple[SpatialDataset, SpatialDataset, dict]:
+    data_dir = Path(data_dir)
+
+    with open(data_dir / "splits.json") as f:
+        splits = json.load(f)
+    with open(data_dir / "summary.json") as f:
+        summary = json.load(f)
+
+    if fold >= len(splits):
+        raise ValueError(f"fold={fold} out of range; only {len(splits)} slides")
+
+    split    = splits[fold]
+    train_ds = SpatialDataset(data_dir, split["train"], max_neighbors, is_train=True)
+    test_ds  = SpatialDataset(data_dir, split["test"],  max_neighbors, is_train=False)
+
+    meta = {
+        "n_genes":     summary["n_genes"],
+        "feature_dim": summary["feature_dim"],
+        "test_slide":  split["test_slide"],
+        "n_train":     len(train_ds),
+        "n_test":      len(test_ds),
+        "n_folds":     len(splits),
+    }
+    return train_ds, test_ds, meta

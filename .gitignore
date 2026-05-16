@@ -1,26 +1,28 @@
-# 数据和缓存
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 数据 / 缓存
 data/
 processed/
-__pycache__/
-
-# 模型和实验记录
-weights/
-experiments/
-
-# 日志文件
-*.log
-# 实验结果
-experiments/
-wandb/
-
-# 数据集
 hest1k_datasets/
-
-# 模型权重
-weights/
-
-# 数据文件
 *.npy
 *.pt
 *.tif
 *.h5ad
+
+# 训练产物
+weights/
+experiments/
+wandb/
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/
+.claude/
