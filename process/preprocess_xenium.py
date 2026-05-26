@@ -121,8 +121,13 @@ def load_one_slide(data_dir: Path, slide_id: str, gene_list: list,
         lambda x: x.decode() if isinstance(x, bytes) else x
     )
 
-    # 过滤：排除未分配细胞（cell_id=0）和低质量转录本
-    df = df[(df["cell_id"] > 0) & (df["qv"] >= qv_threshold)]
+    # 过滤：排除未分配细胞和低质量转录本
+    # cell_id 可能是数值（janesick: 0=未分配）或字符串（如 'UNASSIGNED'）
+    if pd.api.types.is_numeric_dtype(df["cell_id"]):
+        df = df[df["cell_id"] > 0]
+    else:
+        df = df[df["cell_id"].astype(str) != "UNASSIGNED"]
+    df = df[df["qv"] >= qv_threshold]
 
     # 对齐 GHIST：只保留与核重叠的转录本
     if overlaps_nucleus:

@@ -6,14 +6,25 @@ BLANK_, Blank-, NegPrb, Unassigned），保留所有 Gene Expression 类型基�
 与原 HVG 策略的区别：不做主动筛选，保留全部有效基因（约 280 个）。
 
 用法：
-  python select_xenium_genes.py
+  python select_xenium_genes.py   # 默认 janesick
+  python select_xenium_genes.py \
+      --transcripts_dir .../xenium_coad/transcripts \
+      --out_file        .../xenium_coad/processed_data/selected_gene_list.txt
 """
 
+import argparse
 import pandas as pd
 from pathlib import Path
 
-TRANSCRIPTS_DIR = Path("/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick/transcripts")
-OUT_FILE        = Path("/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick/processed_data/selected_gene_list.txt")
+p = argparse.ArgumentParser()
+p.add_argument("--transcripts_dir", type=str,
+               default="/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick/transcripts")
+p.add_argument("--out_file", type=str,
+               default="/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick/processed_data/selected_gene_list.txt")
+args = p.parse_args()
+
+TRANSCRIPTS_DIR = Path(args.transcripts_dir)
+OUT_FILE        = Path(args.out_file)
 
 CONTROL_PREFIXES = [
     "NegControlProbe_",

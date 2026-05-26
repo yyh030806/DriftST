@@ -36,8 +36,8 @@ DRIFT_WEIGHT=0.15
 GATE_ENTROPY_WEIGHT=0.02
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
-OUTPUT_DIR="/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick/processed_data"
-EXP_DIR="/data/buyonggan/DriftST/experiments/xenium_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="/data/buyonggan/DriftST/hest1k_datasets/xenium_coad/processed_data"
+EXP_DIR="/data/buyonggan/DriftST/experiments/xenium_coad_$(date +%Y%m%d_%H%M%S)"
 GENE_LIST="${OUTPUT_DIR}/selected_gene_list.txt"
 
 DEVICE="cuda"
@@ -70,7 +70,7 @@ hr()  { echo "══════════════════════
 SVG_FILE="${OUTPUT_DIR}/svg_ranking.json"
 if [ ! -f "${SVG_FILE}" ]; then
     log "计算 SVG ranking (Moran's I) ..."
-    $PYTHON "${PROCESS_DIR}/compute_svg.py" --data_dir "${OUTPUT_DIR}" --slide TENX94
+    $PYTHON "${PROCESS_DIR}/compute_svg.py" --data_dir "${OUTPUT_DIR}" --slide TENX111
 else
     log "SVG ranking 已存在，跳过计算: ${SVG_FILE}"
 fi
@@ -138,7 +138,7 @@ print(f\"slide={fold['test_slide']} | band={info.get('coord_lo','?'):.0f}-{info.
     fi
 
     if [ "$SNAPSHOT" = true ]; then
-        SNAP_DIR="${REPO_DIR}/snapshots_xenium_zinb_fold${FOLD}"
+        SNAP_DIR="${REPO_DIR}/snapshots_xenium_coad_zinb_fold${FOLD}"
         TRAIN_ARGS+=(--snapshot_epochs ${SNAPSHOT_EPOCHS})
         TRAIN_ARGS+=(--snapshot_dir "${SNAP_DIR}")
         log "snapshot 开启 → ${SNAP_DIR}  (epochs: ${SNAPSHOT_EPOCHS})"

@@ -14,13 +14,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.dataset import build_datasets
 from src.drift_step import PredictionBank, multi_scale_drift_step, drift_loss_fn
-from src.model import GenePredictor
+from src.model import GenePredictor, zinb_loss
 from src.evaluation import evaluate
 
 
@@ -29,6 +28,25 @@ from src.evaluation import evaluate
 # ─────────────────────────────────────────────────────────────
 # Bank 预热
 # ─────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def capture_stochastic(model, loader, device, n_genes, K):
+    """dropout 开启、每个 spot 采样 K 次，汇成预测分布。
+    返回 (pred_samples (N*K, G), true (N, G))。用于可视化 DriftST 真正匹配的随机预测分布。"""
+    model.train()  # 开 dropout
+    preds, trues = [], []
+    for batch in loader:
+        img      = batch["z_img"].to(device)
+        nb_img   = batch["neighbor_zimg"].to(device)
+        nb_valid = batch["neighbor_valid"].to(device)
+        ks = []
+        for _ in range(K):
+            x0, _ = model(img, nb_img, nb_valid)
+            ks.append(x0.cpu().numpy())
+        preds.append(np.stack(ks, axis=1).reshape(-1, n_genes))  # (B*K, G)
+        trues.append(batch["gene_expr"].numpy())
+    return np.concatenate(preds, 0), np.concatenate(trues, 0)
+
 
 @torch.no_grad()
 def warmup_bank(model, loader, bank, device, K: int, min_samples: int):
@@ -109,6 +127,9 @@ def main():
                    help="每层目标保留率，如 0.8 0.5")
     p.add_argument("--gate_entropy_weight", type=float, default=0.1,
                    help="gate 熵正则权重，推动二值化")
+    p.add_argument("--std_weight",      type=float, default=0.0,
+                   help="std-matching loss 权重：每基因 (std(pred)-std(gt))^2 均值。"
+                        "默认 0（用 per-gene affine head 代替）")
     p.add_argument("--balance_slides",  action="store_true",
                    help="按切片做均衡采样：每个切片在 epoch 内期望命中次数相等")
 
@@ -128,6 +149,12 @@ def main():
     p.add_argument("--use_neighbor",    action="store_true",
                    help="启用邻居空间聚合")
     p.add_argument("--max_neighbors",   type=int,   default=6)
+
+    # ── snapshot（用于训练过程可视化，默认关闭）───────────────
+    p.add_argument("--snapshot_epochs", type=int, nargs="+", default=None,
+                   help="在这些 epoch 结束后保存 val 的 pred/true 基因表达矩阵到 snapshot_dir")
+    p.add_argument("--snapshot_dir",    type=str, default=None,
+                   help="snapshot npz 保存目录")
 
     # ── wandb 相关参数 ──────────────────────────────────────
     p.add_argument("--wandb_project",    type=str,   default="DriftST")
@@ -256,12 +283,17 @@ def main():
 
     best_pcc = -1.0
 
+    def std_match_loss(pred, gt):
+        """每个基因 batch 内 std 的 MSE。缓解 MSE 训练带来的均值回归。"""
+        return ((pred.std(dim=0) - gt.std(dim=0)) ** 2).mean()
+
     for epoch in range(args.epochs):
         model.train()
         train_loss        = 0.0
         drift_loss_acc    = 0.0
-        mse_loss_acc      = 0.0
+        zinb_loss_acc     = 0.0
         gate_loss_acc     = 0.0
+        std_loss_acc      = 0.0
         is_warmup = (epoch < args.warm_epochs)
 
         if epoch == args.warm_epochs:
@@ -271,13 +303,20 @@ def main():
         for batch in train_loader:
             img      = batch["z_img"].to(device)
             g_true   = batch["gene_expr"].to(device)
+            g_counts = batch["gene_counts"].to(device)
             nb_img   = batch["neighbor_zimg"].to(device)
             nb_valid = batch["neighbor_valid"].to(device)
             B        = img.shape[0]
 
             if is_warmup:
                 x0, gate_info = model(img, nb_img, nb_valid)
-                loss = F.mse_loss(x0, g_true)
+                loss = zinb_loss(g_counts, x0,
+                                 gate_info["zinb_theta"], gate_info["zinb_pi_logits"])
+
+                if args.std_weight > 0:
+                    s_loss = std_match_loss(x0, g_true)
+                    loss   = loss + args.std_weight * s_loss
+                    std_loss_acc += s_loss.item()
 
                 # gate sparsity loss
                 if gate_info is not None:
@@ -296,8 +335,9 @@ def main():
                 K    = args.gen_per_spot
                 x0_k, gate_info = sample_k_predictions(model, img, K, nb_img, nb_valid)  # (B, K, n_genes)
 
-                # MSE loss：基于第一个预测
-                mse_loss = F.mse_loss(x0_k[:, 0, :], g_true)
+                # ZINB 重建 loss：基于第一个（带梯度的）预测
+                recon_loss = zinb_loss(g_counts, x0_k[:, 0, :],
+                                       gate_info["zinb_theta"], gate_info["zinb_pi_logits"])
 
                 # 正样本：唯一匹配，原始空间 (B, 1, D)
                 pos = g_true.detach().unsqueeze(1)
@@ -315,7 +355,12 @@ def main():
                 )
 
                 d_loss = drift_loss_fn(x0_k, goal_scaled, scale_inp)
-                loss   = args.drift_weight * d_loss + (1 - args.drift_weight) * mse_loss
+                loss   = args.drift_weight * d_loss + (1 - args.drift_weight) * recon_loss
+
+                if args.std_weight > 0:
+                    s_loss = std_match_loss(x0_k[:, 0, :], g_true)
+                    loss   = loss + args.std_weight * s_loss
+                    std_loss_acc += s_loss.item()
 
                 # gate sparsity loss
                 if gate_info is not None:
@@ -325,7 +370,7 @@ def main():
                         gate_loss_acc += g_loss.item()
 
                 drift_loss_acc += d_loss.item()
-                mse_loss_acc   += mse_loss.item()
+                zinb_loss_acc  += recon_loss.item()
 
                 # bank 更新：本批次 B*K 个原始预测全部 enqueue
                 bank.enqueue(x0_k.detach().reshape(-1, n_genes))
@@ -354,6 +399,32 @@ def main():
             model, val_loader, n_genes, device, svg_indices=svg_indices
         )
 
+        # ── snapshot：保存 val 的 pred/true 用于训练过程可视化 ──
+        if args.snapshot_epochs is not None and epoch in args.snapshot_epochs:
+            snap_dir = Path(args.snapshot_dir or (out_dir / "snapshots"))
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            # 确定性点预测（条件均值，参考用）
+            *_, snap_pred_det, snap_true = evaluate(
+                model, val_loader, n_genes, device,
+                svg_indices=svg_indices, return_predictions=True,
+            )
+            # 随机(dropout 采样)预测分布 —— DriftST 真正匹配 target 的分布
+            snap_pred_stoch, _ = capture_stochastic(
+                model, val_loader, device, n_genes, K=args.gen_per_spot,
+            )
+            d_now = (drift_loss_acc / max(1, len(train_loader))) if not is_warmup else float("nan")
+            np.savez_compressed(
+                snap_dir / f"snapshot_epoch{epoch:03d}.npz",
+                pred=snap_pred_stoch.astype(np.float32),     # 随机采样分布(默认画这个)
+                pred_det=snap_pred_det.astype(np.float32),   # 确定性均值(参考)
+                true=snap_true.astype(np.float32),
+                epoch=epoch,
+                drift_loss=d_now,
+                train_loss=train_loss,
+            )
+            model.train()  # capture 后恢复 train 模式
+            print(f"[snapshot] saved epoch {epoch} -> {snap_dir}")
+
         phase = "warm " if is_warmup else "drift"
         if is_warmup:
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} | "
@@ -379,15 +450,19 @@ def main():
             }
             if args.use_gate:
                 log_dict["train/gate_loss"] = gate_loss_acc / n_batches
+            if args.std_weight > 0:
+                log_dict["train/std_loss"] = std_loss_acc / n_batches
             wandb.log(log_dict, step=epoch)
 
         else:
             d_avg = drift_loss_acc / n_batches
-            m_avg = mse_loss_acc   / n_batches
+            z_avg = zinb_loss_acc  / n_batches
             g_avg = gate_loss_acc  / n_batches if args.use_gate else 0.0
+            s_avg = std_loss_acc   / n_batches if args.std_weight > 0 else 0.0
             gate_str = f" gate={g_avg:.4f}" if args.use_gate else ""
+            std_str  = f" std={s_avg:.4f}" if args.std_weight > 0 else ""
             print(f"Epoch {epoch:03d} [{phase}] | Loss: {train_loss:.4f} "
-                  f"(drift={d_avg:.4f} mse={m_avg:.4f}{gate_str}) | "
+                  f"(drift={d_avg:.4f} zinb={z_avg:.4f}{std_str}{gate_str}) | "
                   f"Val PCC: {val_pcc:.4f} | SVG-20: {svg_pcc20:.4f} SVG-50: {svg_pcc50:.4f} | "
                   f"MSE={val_mse:.4f} MAE={val_mae:.4f} | LR: {current_lr:.2e}")
 
@@ -396,7 +471,7 @@ def main():
                 "phase":            1,
                 "train/loss":       train_loss,
                 "train/drift_loss": d_avg,
-                "train/mse_loss":   m_avg,
+                "train/zinb_loss":  z_avg,
                 "val/pcc_all":      val_pcc,
                 "val/pcc_10":       val_pcc10,
                 "val/pcc_50":       val_pcc50,
@@ -413,6 +488,8 @@ def main():
             }
             if args.use_gate:
                 log_dict["train/gate_loss"] = gate_loss_acc / n_batches
+            if args.std_weight > 0:
+                log_dict["train/std_loss"] = std_loss_acc / n_batches
             wandb.log(log_dict, step=epoch)
 
         if val_pcc > best_pcc:

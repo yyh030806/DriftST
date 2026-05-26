@@ -67,10 +67,10 @@ class SpatialDataset(Dataset):
         self.n_spots   = len(valid_bcs)
         self.n_genes   = gene_mat.shape[1]
 
-        # 基因表达（log1p 归一化，常驻内存）
-        self.gene_expr = torch.log1p(
-            torch.tensor(gene_mat[idxs], dtype=torch.float32)
-        )  # (N_split, G)
+        # 原始 count（ZINB loss 用，常驻内存）
+        self.gene_counts = torch.tensor(gene_mat[idxs], dtype=torch.float32)  # (N_split, G)
+        # 基因表达（log1p 归一化，drift / 评估 用，常驻内存）
+        self.gene_expr = torch.log1p(self.gene_counts)  # (N_split, G)
 
         # 图像特征（常驻内存）
         if self.has_aug:
@@ -162,6 +162,7 @@ class SpatialDataset(Dataset):
         return {
             "z_img":            z_img,
             "gene_expr":        gene_expr,
+            "gene_counts":      self.gene_counts[idx],
             "neighbor_zimg":    neighbor_zimg,
             "neighbor_valid":   valid,
             "slide_id":         self.slide_ids[idx],

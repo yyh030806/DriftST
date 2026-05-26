@@ -284,6 +284,62 @@ def gate_sparsity_loss(gates, target_fractions=None, entropy_weight=0.1):
 
 
 # ─────────────────────────────────────────────────────────────
+# ZINB Loss (Zero-Inflated Negative Binomial)
+# ─────────────────────────────────────────────────────────────
+
+def _log_zinb_positive(x, mu, theta, pi_logits, eps=1e-8):
+    """
+    ZINB 对数似然（scVI 标准公式）。
+
+    x         : (B, G) 原始 count（非负整数）
+    mu        : (B, G) NB 均值，> 0
+    theta     : (G,) 或 (B, G) inverse dispersion，> 0
+    pi_logits : (B, G) zero-inflation 的 logit（dropout 概率 = sigmoid(pi_logits)）
+
+    返回逐元素 log-likelihood，shape 同 x。
+    """
+    # theta 可能是 (G,)，广播到 (B, G)
+    if theta.dim() == 1:
+        theta = theta.view(1, -1).expand_as(x)
+
+    softplus_pi      = F.softplus(-pi_logits)
+    log_theta_eps    = torch.log(theta + eps)
+    log_theta_mu_eps = torch.log(theta + mu + eps)
+    pi_theta_log     = -pi_logits + theta * (log_theta_eps - log_theta_mu_eps)
+
+    # count == 0 的情形：dropout 或 NB 取 0
+    case_zero     = F.softplus(pi_theta_log) - softplus_pi
+    mul_case_zero = case_zero * (x < eps).float()
+
+    # count > 0 的情形：NB 概率质量
+    case_non_zero = (
+        -softplus_pi
+        + pi_theta_log
+        + x * (torch.log(mu + eps) - log_theta_mu_eps)
+        + torch.lgamma(x + theta)
+        - torch.lgamma(theta)
+        - torch.lgamma(x + 1)
+    )
+    mul_case_non_zero = case_non_zero * (x > eps).float()
+
+    return mul_case_zero + mul_case_non_zero
+
+
+def zinb_loss(counts, x0, theta, pi_logits, eps=1e-8):
+    """
+    ZINB 负对数似然，替代 MSE 重建项。
+
+    counts    : (B, G) 原始 count
+    x0        : (B, G) 模型点预测（log1p 空间）；μ = expm1(relu(x0))
+    theta     : (G,) 或 (B, G) inverse dispersion，> 0
+    pi_logits : (B, G) zero-inflation logit
+    """
+    mu = torch.expm1(F.relu(x0)).clamp_min(1e-4)        # log1p 空间 → count 尺度
+    ll = _log_zinb_positive(counts, mu, theta, pi_logits, eps)
+    return -ll.mean()
+
+
+# ─────────────────────────────────────────────────────────────
 # 主模型
 # ─────────────────────────────────────────────────────────────
 
@@ -398,6 +454,15 @@ class GenePredictor(nn.Module):
         # ── 输出头 ───────────────────────────────────────────
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Linear(hidden_dim, 1)
+        # per-gene affine：α 把 backbone 的 raw logit 拉到 GT 的 scale，β 平移到 GT 均值
+        self.gene_alpha = nn.Parameter(torch.ones(output_dim))
+        self.gene_beta  = nn.Parameter(torch.zeros(output_dim))
+
+        # ── ZINB 头：μ 复用 x0（μ=expm1(relu(x0))），此处给 θ、π ──
+        # π: 每 spot×基因 的 zero-inflation logit
+        self.zinb_pi_head = nn.Linear(hidden_dim, 1)
+        # θ: 每基因可学习 inverse dispersion（scVI 默认 gene-level），存 log 保证正
+        self.zinb_log_theta = nn.Parameter(torch.zeros(output_dim))
 
         self._init_weights()
 
@@ -461,14 +526,19 @@ class GenePredictor(nn.Module):
                 all_gates.append(gate)
 
         # ── Output ───────────────────────────────────────────
-        x0 = self.head(self.out_norm(gene_tokens)).squeeze(-1)
+        h_out = self.out_norm(gene_tokens)
+        x0 = self.head(h_out).squeeze(-1)
+        x0 = self.gene_alpha * x0 + self.gene_beta            # per-gene affine
 
-        # ── model_out：gate 信息打包 ────────────────────────
+        # ── model_out：gate 信息 + ZINB 参数打包 ────────────
         model_out = {}
+        # ZINB 参数：μ 由 x0 在 loss 内导出，这里给 θ、π
+        model_out['zinb_pi_logits'] = self.zinb_pi_head(h_out).squeeze(-1)   # (B, G)
+        model_out['zinb_theta']     = self.zinb_log_theta.exp().clamp(1e-4, 1e4)  # (G,)
         if all_gates:
             model_out['gate_sparsity_loss'] = gate_sparsity_loss(
                 all_gates, self.gate_target_fractions,
                 entropy_weight=self.gate_entropy_weight,
             )
 
-        return x0, model_out or None
+        return x0, model_out

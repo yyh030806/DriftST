@@ -62,8 +62,9 @@ def main():
 
     splits = []
     for fold_id, test_idx in enumerate(fold_indices):
+        test_set  = set(test_idx)
         test_bcs  = [barcodes[i] for i in test_idx]
-        train_bcs = [barcodes[i] for i in range(n) if i not in set(test_idx)]
+        train_bcs = [barcodes[i] for i in range(n) if i not in test_set]
 
         coord_lo = slide_obs.iloc[test_idx[0]][coord_col]
         coord_hi = slide_obs.iloc[test_idx[-1]][coord_col]
