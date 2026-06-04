@@ -132,6 +132,14 @@ class PredictionBank:
     def enqueue(self, feat: torch.Tensor):
         feat = feat.detach().cpu().float()
         N    = feat.shape[0]
+
+        # 单次入队数量 >= 缓冲容量：只保留最近 size 个，重置指针
+        if N >= self.size:
+            self.buf[:] = feat[-self.size:]
+            self.ptr    = 0
+            self.count  = self.size
+            return
+
         end  = self.ptr + N
 
         if end <= self.size:

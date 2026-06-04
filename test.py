@@ -17,7 +17,8 @@ from torch.utils.data import DataLoader
 
 from src.dataset import build_datasets
 from src.model import GenePredictor
-from src.evaluation import evaluate
+from src.evaluation import evaluate, metrics_from_arrays
+from src.postprocess import gene_stats, variance_postprocess
 
 
 def parse_args():
@@ -31,6 +32,11 @@ def parse_args():
     p.add_argument("--batch_size",   type=int, default=256)
     p.add_argument("--save_h5ad",    type=str, default=None,
                    help="导出 AnnData：X=pred, layers['gt']=gt, obsm['spatial']=坐标")
+    p.add_argument("--variance_postproc", action="store_true",
+                   help="对预测做逐基因方差后处理（仿射校准到训练集 per-gene 分布），"
+                        "改善 JSD/动态范围，不改 PCC。开启后评估与导出都用校准后的预测。")
+    p.add_argument("--postproc_alpha", type=float, default=1.2,
+                   help="方差放大系数；1.0=对齐训练集方差，>1 过冲（默认 1.2）。")
 
     # ─── 必须与训练一致的模型结构超参 ───
     p.add_argument("--input_dim",    type=int,   default=2048)
@@ -116,9 +122,25 @@ def main():
 
     # ── 评估 ─────────────────────────────────────────────────
     print(f"\n{'='*60}\nfold {args.fold} 评估\n{'='*60}")
+    need_pred = bool(args.save_h5ad) or args.variance_postproc
     results = evaluate(model, val_loader, n_genes, device,
                        svg_indices=svg_indices,
-                       return_predictions=bool(args.save_h5ad))
+                       return_predictions=need_pred)
+
+    # ── 可选：方差后处理（仿射校准到训练集 per-gene 分布）──────────
+    if args.variance_postproc:
+        all_pred, all_true = results[-2], results[-1]
+        ref_mean, ref_std = gene_stats(exprs)          # exprs = 训练集表达 (N_train, n_genes)
+        all_pred_cal = variance_postprocess(
+            all_pred, ref_mean, ref_std, alpha=args.postproc_alpha)
+        std_ratio = (all_pred_cal.std(0) / (all_true.std(0) + 1e-12)).mean()
+        print(f"\n[方差后处理] alpha={args.postproc_alpha}  "
+              f"std(pred)/std(gt) {all_pred.std(0).mean()/ (all_true.std(0).mean()+1e-12):.3f} "
+              f"-> {std_ratio:.3f}")
+        print("[校准后指标]")
+        metrics_from_arrays(all_pred_cal, all_true, n_genes, svg_indices=svg_indices)
+        # 用校准后的预测覆盖 results，供后续导出
+        results = (*results[:-2], all_pred_cal, all_true)
 
     # ── 可选导出 h5ad ────────────────────────────────────────
     if args.save_h5ad:
@@ -145,7 +167,12 @@ def main():
             layers= {"gt": all_true.astype("float32")},
         )
         adata.uns["fold"] = args.fold
-        adata.uns["note"] = "X = predicted ln(x+1) expression; layers['gt'] = ground truth ln(x+1)"
+        if args.variance_postproc:
+            adata.uns["note"] = ("X = predicted ln(x+1), variance post-processed "
+                                 f"(per-gene affine calib to train dist, alpha={args.postproc_alpha}); "
+                                 "layers['gt'] = ground truth ln(x+1)")
+        else:
+            adata.uns["note"] = "X = predicted ln(x+1) expression; layers['gt'] = ground truth ln(x+1)"
 
         out_path = Path(args.save_h5ad)
         out_path.parent.mkdir(parents=True, exist_ok=True)
