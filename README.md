@@ -23,8 +23,7 @@ DriftST/
 │   ├── run_preprocess.sh     #   Xenium 预处理
 │   ├── run_xenium.sh         #   Xenium janesick 单切片 5-fold 训练
 │   ├── run_xenium_coad.sh    #   Xenium coad 单切片 5-fold 训练
-│   ├── run_experiment.sh     #   her2st / prad / kidney 预处理 + 训练
-│   └── run_coad_ablation_*.sh#   消融实验脚本
+│   └── run_experiment.sh     #   her2st / prad / kidney 预处理 + 训练
 ├── eval/                     # 独立评估脚本
 │   └── eval_dist_metrics.py  #   在 ckpt 上复算 PCC/SVG + JSD/SSIM（分布/结构指标）
 ├── plotting/                 # 绘图脚本
