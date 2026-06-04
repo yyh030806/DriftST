@@ -32,9 +32,9 @@ def parse_args():
     p.add_argument("--batch_size",   type=int, default=256)
     p.add_argument("--save_h5ad",    type=str, default=None,
                    help="导出 AnnData：X=pred, layers['gt']=gt, obsm['spatial']=坐标")
-    p.add_argument("--variance_postproc", action="store_true",
-                   help="对预测做逐基因方差后处理（仿射校准到训练集 per-gene 分布），"
-                        "改善 JSD/动态范围，不改 PCC。开启后评估与导出都用校准后的预测。")
+    p.add_argument("--variance_postproc", action=argparse.BooleanOptionalAction, default=True,
+                   help="逐基因方差后处理（仿射校准到训练集 per-gene 分布），默认开启；"
+                        "用 --no-variance-postproc 关闭。改善 JSD/动态范围，不改 PCC。")
     p.add_argument("--postproc_alpha", type=float, default=1.2,
                    help="方差放大系数；1.0=对齐训练集方差，>1 过冲（默认 1.2）。")
 
