@@ -1,15 +1,11 @@
-"""模型评估：per-gene PCC、SVG-PCC、log2 空间 MSE/MAE。"""
+"""Evaluation helpers for per-gene PCC, SVG-PCC, and log2-space errors."""
 import numpy as np
 import torch
 from scipy.stats import pearsonr
 
 
 def metrics_from_arrays(all_pred, all_true, n_genes, svg_indices=None, verbose=True):
-    """从 (pred, true) 数组直接算 12 个指标，与 evaluate() 内部口径一致。
-
-    用于对后处理（方差校准）后的预测重新评估，无需再过模型。
-    返回与 evaluate() 相同的 12 元组。
-    """
+    """Compute the same metric tuple as ``evaluate`` from numpy arrays."""
     all_pred = np.asarray(all_pred)
     all_true = np.asarray(all_true)
 
@@ -53,7 +49,7 @@ def evaluate(model, loader, n_genes, device, svg_indices=None, return_prediction
     """
     svg_indices: list of gene indices sorted by Moran's I (descending).
                  If provided, reports PCC for top-20 and top-50 SVGs.
-    return_predictions: 若 True，额外返回 (all_pred, all_true) numpy 数组。
+    return_predictions: if True, append ``(all_pred, all_true)`` arrays.
     """
     model.eval()
     all_pred, all_true = [], []
@@ -97,7 +93,7 @@ def evaluate(model, loader, n_genes, device, svg_indices=None, return_prediction
     mse_log2 = float(np.mean(((all_pred - all_true) / ln2) ** 2))
     mae_log2 = float(np.mean(np.abs((all_pred - all_true) / ln2)))
 
-    # SVG PCC（按 Moran's I 排序的 top-20 / top-50）
+    # SVG PCC for top genes ranked by Moran's I.
     svg_pcc20, svg_pcc50 = 0.0, 0.0
     if svg_indices is not None and len(svg_indices) > 0:
         svg_pccs = [gene_pccs[i] for i in svg_indices if i < n_genes]

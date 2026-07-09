@@ -1,0 +1,19 @@
+anndata
+numpy
+pandas
+pillow
+safetensors
+scanpy
+scikit-learn
+scipy
+squidpy
+tifffile
+timm
+torch
+torchvision
+tqdm
+wandb
+
+# CONCH is required for preprocessing. Install it from the official CONCH
+# repository/environment used by your institution, so that
+# `conch.open_clip_custom` is importable.

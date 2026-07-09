@@ -1,24 +1,28 @@
-#!/bin/bash
-# Xenium (TENX94) 预处理：生成基因列表 + 重建表达矩阵 + 提取图像特征
-set -e
+#!/usr/bin/env bash
+# Prepare the default Xenium breast cancer processed dataset.
 
-PYTHON="/data/buyonggan/miniconda3/envs/DriftST/bin/python"
+set -euo pipefail
+
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PROCESS_DIR="${REPO_DIR}/process"
-XENIUM_DIR="/data/buyonggan/DriftST/hest1k_datasets/xenium_janesick"
+PYTHON="${PYTHON:-python}"
+XENIUM_DIR="${XENIUM_DIR:-${REPO_DIR}/hest1k_datasets/xenium_janesick}"
+OUTPUT_DIR="${OUTPUT_DIR:-${XENIUM_DIR}/processed_data}"
+GENE_LIST="${GENE_LIST:-${OUTPUT_DIR}/selected_gene_list.txt}"
+SLIDES="${SLIDES:-TENX94 TENX95}"
+TEST_SLIDE="${TEST_SLIDE:-TENX95}"
+DEVICE="${DEVICE:-cuda}"
 
-# Step 1: 生成基因列表（黑名单过滤）
-$PYTHON "${PROCESS_DIR}/select_xenium_genes.py"
+mkdir -p "${OUTPUT_DIR}"
 
-# Step 2: 预处理（仅 TENX94）
-CUDA_VISIBLE_DEVICES=3 $PYTHON "${PROCESS_DIR}/preprocess_xenium.py" \
-    --data_dir   "${XENIUM_DIR}" \
-    --output_dir "${XENIUM_DIR}/processed_data" \
-    --gene_list  "${XENIUM_DIR}/processed_data/selected_gene_list.txt" \
-    --slides     TENX94 \
-    --test_slide TENX94 \
-    --overlaps_nucleus \
-    --min_counts 70 \
-    --batch_size 256 \
-    --device cuda \
-    2>&1 | tee "${REPO_DIR}/preprocess_xenium.log"
+"${PYTHON}" "${REPO_DIR}/process/select_xenium_genes.py" \
+    --transcripts_dir "${XENIUM_DIR}/transcripts" \
+    --out_file "${GENE_LIST}"
+
+"${PYTHON}" "${REPO_DIR}/process/preprocess_xenium.py" \
+    --data_dir "${XENIUM_DIR}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --gene_list "${GENE_LIST}" \
+    --slides ${SLIDES} \
+    --test_slide "${TEST_SLIDE}" \
+    --neighbor_r "${NEIGHBOR_R:-300.0}" \
+    --device "${DEVICE}"

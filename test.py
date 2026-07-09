@@ -1,6 +1,6 @@
-"""加载 best ckpt 在 val 集上跑 evaluate。
+"""Evaluate a trained DriftST checkpoint on a validation/test split.
 
-用法（参数与 train.py 保持一致，必须传与训练相同的模型架构超参）:
+Usage:
   python test.py \
       --data_dir hest1k_datasets/xenium_janesick/processed_data \
       --fold 0 \
@@ -26,19 +26,20 @@ def parse_args():
     p.add_argument("--data_dir",     type=str, required=True)
     p.add_argument("--fold",         type=int, required=True)
     p.add_argument("--ckpt",         type=str, required=True,
-                   help="best.pt 路径")
+                   help="path to a trained checkpoint")
     p.add_argument("--device",       type=str, default="cuda")
     p.add_argument("--num_workers",  type=int, default=4)
     p.add_argument("--batch_size",   type=int, default=256)
     p.add_argument("--save_h5ad",    type=str, default=None,
-                   help="导出 AnnData：X=pred, layers['gt']=gt, obsm['spatial']=坐标")
-    p.add_argument("--variance_postproc", action=argparse.BooleanOptionalAction, default=True,
-                   help="逐基因方差后处理（仿射校准到训练集 per-gene 分布），默认开启；"
-                        "用 --no-variance-postproc 关闭。改善 JSD/动态范围，不改 PCC。")
+                   help="export AnnData with X=pred, layers['gt']=gt, obsm['spatial']=coordinates")
+    p.add_argument("--variance-postproc", "--variance_postproc",
+                   dest="variance_postproc",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="enable per-gene affine variance calibration against the training split")
     p.add_argument("--postproc_alpha", type=float, default=1.2,
-                   help="方差放大系数；1.0=对齐训练集方差，>1 过冲（默认 1.2）。")
+                   help="variance multiplier; 1.0 matches the reference variance")
 
-    # ─── 必须与训练一致的模型结构超参 ───
+    # Model hyperparameters must match training.
     p.add_argument("--input_dim",    type=int,   default=2048)
     p.add_argument("--hidden_dim",   type=int,   default=256)
     p.add_argument("--num_layers",   type=int,   default=4)
@@ -57,7 +58,6 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    # ── SVG ranking（用于 SVG-PCC）───────────────────────────
     svg_indices = None
     svg_path = Path(args.data_dir) / "svg_ranking.json"
     if svg_path.exists():
@@ -65,11 +65,10 @@ def main():
         gene_names = json.load(open(Path(args.data_dir) / "gene_names.json"))
         gene2idx = {g: i for i, g in enumerate(gene_names)}
         svg_indices = [gene2idx[g] for g in svg_data["ranking"] if g in gene2idx]
-        print(f"SVG ranking 加载完成，共 {len(svg_indices)} 个基因")
+        print(f"Loaded SVG ranking with {len(svg_indices)} genes")
 
-    # ── 数据 ─────────────────────────────────────────────────
     raw_train_ds, val_ds, meta = build_datasets(
-        data_dir=args.data_dir, fold=args.fold
+        data_dir=args.data_dir, fold=args.fold, max_neighbors=args.max_neighbors
     )
     n_genes = meta["n_genes"]
     val_loader = DataLoader(
@@ -77,7 +76,6 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── 模型 ─────────────────────────────────────────────────
     model = GenePredictor(
         input_dim    = args.input_dim,
         hidden_dim   = args.hidden_dim,
@@ -93,14 +91,13 @@ def main():
         max_neighbors = args.max_neighbors,
     ).to(device)
 
-    # 训练时 load 的共表达矩阵需要重建（结构里有 bio_bias buffer）
+    # Reconstruct the training co-expression matrix used by the bio_bias buffer.
     exprs = raw_train_ds.gene_expr.numpy()
     R = np.corrcoef(exprs.T)
     R = np.nan_to_num(R, nan=0.0)
     model.load_bio_bias(R)
 
-    # ── 加载权重 ─────────────────────────────────────────────
-    print(f"加载 ckpt: {args.ckpt}")
+    print(f"Loading checkpoint: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -109,7 +106,7 @@ def main():
     if unexpected:
         print(f"[warn] unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
-    # ── Legacy: 老 ckpt 含 gene_order，自动补回输出置换 ─────────
+    # Legacy checkpoints may carry a gene_order permutation.
     legacy_order = ckpt.get("gene_order")
     if legacy_order is not None and legacy_order != list(range(n_genes)):
         legacy_inv = torch.argsort(torch.tensor(legacy_order, dtype=torch.long)).to(device)
@@ -118,43 +115,37 @@ def main():
             x0, info = original_forward(*a, **kw)
             return x0[:, legacy_inv], info
         model.forward = legacy_forward
-        print(f"[legacy] 检测到老 ckpt 的 gene_order，已在输出端自动应用置换")
+        print("[legacy] Applied output permutation from checkpoint gene_order")
 
-    # ── 评估 ─────────────────────────────────────────────────
-    print(f"\n{'='*60}\nfold {args.fold} 评估\n{'='*60}")
+    print(f"\n{'='*60}\nfold {args.fold} evaluation\n{'='*60}")
     need_pred = bool(args.save_h5ad) or args.variance_postproc
     results = evaluate(model, val_loader, n_genes, device,
                        svg_indices=svg_indices,
                        return_predictions=need_pred)
 
-    # ── 可选：方差后处理（仿射校准到训练集 per-gene 分布）──────────
     if args.variance_postproc:
         all_pred, all_true = results[-2], results[-1]
-        ref_mean, ref_std = gene_stats(exprs)          # exprs = 训练集表达 (N_train, n_genes)
+        ref_mean, ref_std = gene_stats(exprs)
         all_pred_cal = variance_postprocess(
             all_pred, ref_mean, ref_std, alpha=args.postproc_alpha)
         std_ratio = (all_pred_cal.std(0) / (all_true.std(0) + 1e-12)).mean()
-        print(f"\n[方差后处理] alpha={args.postproc_alpha}  "
+        print(f"\n[variance calibration] alpha={args.postproc_alpha}  "
               f"std(pred)/std(gt) {all_pred.std(0).mean()/ (all_true.std(0).mean()+1e-12):.3f} "
               f"-> {std_ratio:.3f}")
-        print("[校准后指标]")
+        print("[calibrated metrics]")
         metrics_from_arrays(all_pred_cal, all_true, n_genes, svg_indices=svg_indices)
-        # 用校准后的预测覆盖 results，供后续导出
         results = (*results[:-2], all_pred_cal, all_true)
 
-    # ── 可选导出 h5ad ────────────────────────────────────────
     if args.save_h5ad:
         import anndata as ad
         import pandas as pd
         all_pred, all_true = results[-2], results[-1]
 
-        # gene 名 + barcode + 空间坐标
         gene_names = json.load(open(Path(args.data_dir) / "gene_names.json"))[:n_genes]
         barcodes   = val_ds.barcodes
         obs_meta   = pd.read_csv(Path(args.data_dir) / "obs_metadata.csv", index_col=0)
         obs_sub    = obs_meta.loc[barcodes].copy()
 
-        # 兼容 pixel_x/pixel_y 或 x/y
         xcol = "pixel_x" if "pixel_x" in obs_sub.columns else "x"
         ycol = "pixel_y" if "pixel_y" in obs_sub.columns else "y"
         spatial = obs_sub[[xcol, ycol]].to_numpy()
@@ -177,7 +168,7 @@ def main():
         out_path = Path(args.save_h5ad)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         adata.write_h5ad(out_path)
-        print(f"已导出 → {out_path}  shape={adata.shape}")
+        print(f"Exported {out_path}  shape={adata.shape}")
 
 
 if __name__ == "__main__":

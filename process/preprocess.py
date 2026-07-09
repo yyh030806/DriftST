@@ -1,18 +1,9 @@
-"""
-preprocess_her2st.py
-====================
-HER2ST (HEST格式) 预处理脚本
-
-用法：
-   python preprocess_her2st.py \
-        --data_dir  /data/buyonggan/DriftST/hest1k_datasets/her2st \
-        --output_dir /data/buyonggan/DriftST/hest1k_datasets/her2st/processed_data \
-        --gene_list  /data/buyonggan/DriftST/hest1k_datasets/her2st/processed_data/selected_gene_list.txt
-"""
+"""Preprocess HEST-style spot-level datasets for DriftST."""
 
 import json
 import logging
 import argparse
+import os
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -29,9 +20,10 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-WEIGHTS_DIR       = Path("/data/buyonggan/DriftST/weights")
-UNI2_WEIGHTS_DIR  = WEIGHTS_DIR / "uni2"
-CONCH_WEIGHTS_DIR = WEIGHTS_DIR / "conch"
+DEFAULT_WEIGHTS_DIR = Path(os.environ.get(
+    "DRIFTST_WEIGHTS_DIR",
+    Path(__file__).resolve().parents[1] / "weights",
+))
 
 
 # ─────────────────────────────────────────────
@@ -41,45 +33,47 @@ CONCH_WEIGHTS_DIR = WEIGHTS_DIR / "conch"
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir",   type=str, required=True,
-                   help="her2st 根目录，下面有 st/ 和 wsis/ 子目录")
+                   help="dataset root containing st/ and wsis/")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--gene_list",  type=str, required=True,
-                   help="STEM 的 select_gene_list.txt 路径")
+                   help="path to selected_gene_list.txt")
     p.add_argument("--neighbor_r", type=float, default=150.0)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--device",     type=str, default="cuda")
+    p.add_argument("--weights_dir", type=str, default=str(DEFAULT_WEIGHTS_DIR),
+                   help="directory containing uni2/ and conch/ weights")
     p.add_argument("--slides",     type=str, nargs="*", default=None,
-                   help="指定处理哪些 slide，默认全部 SPA119-SPA154")
+                   help="slides to process; defaults to SPA119-SPA154")
     p.add_argument("--test_slide", type=str, default=None,
-                   help="固定 test slide（如 MEND145），其余全为 train；不指定则做 leave-one-out")
+                   help="fixed test slide; leave unset for leave-one-slide-out")
     return p.parse_args()
 
 
 # ─────────────────────────────────────────────
-# Step 1: 加载基因列表
+# Step 1: load gene list
 # ─────────────────────────────────────────────
 
 def load_gene_list(gene_list_path: str):
     with open(gene_list_path, "r") as f:
         genes = [l.strip() for l in f if l.strip()]
-    logger.info(f"加载基因列表: {len(genes)} 个基因 ({gene_list_path})")
+    logger.info(f"Loaded gene list: {len(genes)} genes ({gene_list_path})")
     return genes
 
 
 # ─────────────────────────────────────────────
-# Step 2: 加载单个 slide
+# Step 2: load one slide
 # ─────────────────────────────────────────────
 
 def load_one_slide(st_path: Path, slide_id: str, gene_list: list):
     h5ad_file = st_path / f"{slide_id}.h5ad"
     if not h5ad_file.exists():
-        raise FileNotFoundError(f"找不到: {h5ad_file}")
+        raise FileNotFoundError(f"Missing file: {h5ad_file}")
 
     adata = sc.read_h5ad(str(h5ad_file))
 
     missing = [g for g in gene_list if g not in adata.var_names]
     if missing:
-        logger.warning(f"  [{slide_id}] {len(missing)} 个基因不存在，补0列")
+        logger.warning(f"  [{slide_id}] {len(missing)} genes are missing; filling zeros")
 
     available = [g for g in gene_list if g in adata.var_names]
     adata_sub = adata[:, available].copy()
@@ -98,7 +92,7 @@ def load_one_slide(st_path: Path, slide_id: str, gene_list: list):
         adata_sub = adata_sub[:, gene_list].copy()
 
     if "spatial" not in adata.obsm:
-        raise ValueError(f"[{slide_id}] 缺少 obsm['spatial']")
+        raise ValueError(f"[{slide_id}] missing obsm['spatial']")
     adata_sub.obsm["spatial"] = adata.obsm["spatial"]
 
     spot_diameter = None
@@ -121,18 +115,23 @@ def load_one_slide(st_path: Path, slide_id: str, gene_list: list):
 
 
 # ─────────────────────────────────────────────
-# Step 3: 加载编码器
+# Step 3: load encoders
 # ─────────────────────────────────────────────
 
-def load_encoders(device: str):
+def load_encoders(device: str, weights_dir: Path):
     from timm.models.vision_transformer import VisionTransformer
     from timm.layers.mlp import GluMlp
     from torchvision import transforms
 
-    logger.info(f"加载 UNI2 from {UNI2_WEIGHTS_DIR}")
-    ckpt_files = (list(UNI2_WEIGHTS_DIR.glob("*.bin")) +
-                  list(UNI2_WEIGHTS_DIR.glob("*.safetensors")) +
-                  list(UNI2_WEIGHTS_DIR.glob("*.pth")))
+    uni2_weights_dir = weights_dir / "uni2"
+    conch_weights_dir = weights_dir / "conch"
+
+    logger.info(f"Loading UNI2 from {uni2_weights_dir}")
+    ckpt_files = (list(uni2_weights_dir.glob("*.bin")) +
+                  list(uni2_weights_dir.glob("*.safetensors")) +
+                  list(uni2_weights_dir.glob("*.pth")))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No UNI2 checkpoint found in {uni2_weights_dir}")
     ckpt_path  = ckpt_files[0]
 
     if ckpt_path.suffix == ".safetensors":
@@ -158,9 +157,9 @@ def load_encoders(device: str):
     ])
 
     from conch.open_clip_custom import create_model_from_pretrained
-    logger.info(f"加载 CONCH from {CONCH_WEIGHTS_DIR}")
+    logger.info(f"Loading CONCH from {conch_weights_dir}")
     conch_model, conch_tf = create_model_from_pretrained(
-        "conch_ViT-B-16", str(CONCH_WEIGHTS_DIR / "pytorch_model.bin")
+        "conch_ViT-B-16", str(conch_weights_dir / "pytorch_model.bin")
     )
     conch_model.eval().to(device)
 
@@ -168,12 +167,12 @@ def load_encoders(device: str):
 
 
 # ─────────────────────────────────────────────
-# 特征提取辅助：一批 patches → (B, 2048)
+# Feature extraction helper: one patch batch -> (B, 2048)
 # ─────────────────────────────────────────────
 
 def encode_patches(patches, uni_model, uni_tf, conch_model, conch_tf,
                    uni_ln, conch_ln, device):
-    """对一批 PIL Image 提取 UNI2+CONCH 特征，返回 (B, 2048) numpy"""
+    """Extract UNI2+CONCH features for a batch of PIL images."""
     with torch.no_grad():
         uni_t = torch.stack([
             uni_tf(p.resize((224, 224), Image.Resampling.LANCZOS))
@@ -193,7 +192,7 @@ def encode_patches(patches, uni_model, uni_tf, conch_model, conch_tf,
 
 
 # ─────────────────────────────────────────────
-# Step 4: patch 提取 + 特征编码
+# Step 4: patch extraction and feature encoding
 # ─────────────────────────────────────────────
 
 def extract_features_for_slide(wsi_path: Path, slide_id: str,
@@ -201,16 +200,16 @@ def extract_features_for_slide(wsi_path: Path, slide_id: str,
                                 spot_diameter: float,
                                 uni_model, uni_tf, conch_model, conch_tf,
                                 device: str, batch_size: int) -> dict:
-    """返回 {prefixed_barcode: np.ndarray (2048,)}"""
+    """Return a mapping from prefixed barcode to a 2048-d image feature."""
     tif_file = wsi_path / f"{slide_id}.tif"
     if not tif_file.exists():
-        raise FileNotFoundError(f"找不到 WSI: {tif_file}")
+        raise FileNotFoundError(f"Missing WSI: {tif_file}")
 
     radius = max(112, int(spot_diameter // 2)) if spot_diameter else 112
     logger.info(f"  [{slide_id}] spot_diameter={spot_diameter:.1f}  radius={radius}")
 
     Image.MAX_IMAGE_PIXELS = None
-    image = Image.open(str(tif_file))   # 懒加载，不解码全图
+    image = Image.open(str(tif_file))
     w, h  = image.size
 
     uni_ln   = nn.LayerNorm(1536).to(device)
@@ -221,7 +220,7 @@ def extract_features_for_slide(wsi_path: Path, slide_id: str,
     skipped  = 0
 
     for i in tqdm(range(0, len(barcodes), batch_size),
-                  desc=f"  [{slide_id}] 特征提取", leave=False):
+                  desc=f"  [{slide_id}] feature extraction", leave=False):
         batch_bc = barcodes[i : i + batch_size]
         patches, valid_bc = [], []
 
@@ -248,16 +247,16 @@ def extract_features_for_slide(wsi_path: Path, slide_id: str,
             results[bc] = z[j]
 
     image.close()
-    logger.info(f"  [{slide_id}] 提取 {len(results)} 个，跳过边缘 {skipped} 个")
+    logger.info(f"  [{slide_id}] extracted {len(results)} patches, skipped {skipped} boundary spots")
     return results
 
 
 # ─────────────────────────────────────────────
-# Step 5: 空间邻居
+# Step 5: spatial neighbors
 # ─────────────────────────────────────────────
 
 def build_neighbor_map(adata_all, radius: float) -> dict:
-    logger.info(f"建空间邻居索引 (radius={radius})...")
+    logger.info(f"Building spatial neighbor index (radius={radius})...")
     neighbor_map = {}
 
     for slide_id in adata_all.obs["slide_id"].unique():
@@ -273,12 +272,12 @@ def build_neighbor_map(adata_all, radius: float) -> dict:
             neighbor_map[bc] = [barcodes[j] for j in idxs]
 
     n_avg = np.mean([len(v) for v in neighbor_map.values()])
-    logger.info(f"  平均邻居数: {n_avg:.2f}")
+    logger.info(f"  Average neighbors: {n_avg:.2f}")
     return neighbor_map
 
 
 # ─────────────────────────────────────────────
-# Step 6: 保存
+# Step 6: save
 # ─────────────────────────────────────────────
 
 def save_all(output_dir: Path, adata_all, z_img_all: dict,
@@ -297,7 +296,7 @@ def save_all(output_dir: Path, adata_all, z_img_all: dict,
     # z_img_features.npy: (N_spots, 2048)
     missing = [bc for bc in barcodes if bc not in z_img_all]
     if missing:
-        logger.warning(f"  {len(missing)} 个 barcode 没有图像特征，用零填充")
+        logger.warning(f"  {len(missing)} barcodes are missing image features; filling zeros")
 
     feat_dim  = next(iter(z_img_all.values())).shape[-1]
     z_img_mat = np.stack([
@@ -328,11 +327,11 @@ def save_all(output_dir: Path, adata_all, z_img_all: dict,
         json.dump(summary, f, indent=2)
 
     logger.info("=" * 50)
-    logger.info("预处理完成，summary:")
+    logger.info("Preprocessing complete. Summary:")
     for k, v in summary.items():
         if k != "bc2slide":
             logger.info(f"  {k}: {v}")
-    logger.info(f"输出目录: {output_dir}")
+    logger.info(f"Output directory: {output_dir}")
 
 
 # ─────────────────────────────────────────────
@@ -346,6 +345,7 @@ def main():
     st_path    = data_dir / "st"
     wsi_path   = data_dir / "wsis"
     device     = args.device if torch.cuda.is_available() else "cpu"
+    weights_dir = Path(args.weights_dir)
 
     logger.info(f"Device     : {device}")
     logger.info(f"Data dir   : {data_dir}")
@@ -355,46 +355,42 @@ def main():
         fn_lst = args.slides
     else:
         fn_lst = [f"SPA{i}" for i in range(119, 155)]
-    logger.info(f"共 {len(fn_lst)} 个 slide: {fn_lst}")
+    logger.info(f"Slides to process ({len(fn_lst)}): {fn_lst}")
 
-    # ── Step 1: 基因列表 ──
     gene_list = load_gene_list(args.gene_list)
 
-    # ── Step 2: 加载所有 slide ──
-    logger.info("\n=== Step 2: 加载 slide 基因表达 ===")
+    logger.info("\n=== Step 2: Load slide expression matrices ===")
     adatas_dict: dict = {}
     for slide_id in fn_lst:
         try:
             adatas_dict[slide_id] = load_one_slide(st_path, slide_id, gene_list)
         except Exception as e:
-            logger.error(f"  [{slide_id}] 失败: {e}")
+            logger.error(f"  [{slide_id}] failed: {e}")
 
     if not adatas_dict:
-        raise RuntimeError("所有 slide 加载失败")
+        raise RuntimeError("All slides failed to load")
 
     adata_all = anndata.concat(
         [adatas_dict[sid] for sid in fn_lst if sid in adatas_dict],
         axis=0, merge="same"
     )
     adata_all.var_names_make_unique()
-    logger.info(f"合并后: {adata_all.shape[0]} spots x {adata_all.shape[1]} genes")
+    logger.info(f"Merged data: {adata_all.shape[0]} spots x {adata_all.shape[1]} genes")
 
-    # ── Step 3: 加载编码器 ──
-    logger.info("\n=== Step 3: 加载编码器 ===")
-    uni_model, uni_tf, conch_model, conch_tf = load_encoders(device)
+    logger.info("\n=== Step 3: Load encoders ===")
+    uni_model, uni_tf, conch_model, conch_tf = load_encoders(device, weights_dir)
 
-    # ── Step 4: 特征提取 ──
-    logger.info(f"\n=== Step 4: 图像特征提取 ===")
+    logger.info("\n=== Step 4: Extract image features ===")
     z_img_all = {}
     for slide_id in fn_lst:
         if slide_id not in adatas_dict:
-            logger.warning(f"  [{slide_id}] Step 2 加载失败，跳过特征提取")
+            logger.warning(f"  [{slide_id}] failed in Step 2; skipping feature extraction")
             continue
 
         mask   = adata_all.obs["slide_id"] == slide_id
         obs_df = adata_all.obs[mask][["pixel_x", "pixel_y"]]
         if len(obs_df) == 0:
-            logger.warning(f"  [{slide_id}] 无有效 spot，跳过")
+            logger.warning(f"  [{slide_id}] has no valid spots; skipping")
             continue
 
         spot_diam = adatas_dict[slide_id].uns.get("spot_diameter_fullres", None)
@@ -408,21 +404,20 @@ def main():
             )
             z_img_all.update(feats)
         except Exception as e:
-            logger.error(f"  [{slide_id}] 特征提取失败: {e}")
+            logger.error(f"  [{slide_id}] feature extraction failed: {e}")
 
     del uni_model, conch_model
     torch.cuda.empty_cache()
 
-    # ── Step 5: 空间邻居 ──
-    logger.info("\n=== Step 5: 建空间邻居索引 ===")
+    logger.info("\n=== Step 5: Build spatial neighbor index ===")
     neighbor_map = build_neighbor_map(adata_all, radius=args.neighbor_r)
 
     # ── Step 6: splits ──
     slides = sorted(adata_all.obs["slide_id"].unique().tolist())
     if args.test_slide:
         if args.test_slide not in slides:
-            raise ValueError(f"--test_slide {args.test_slide} 不在已加载的 slides 中: {slides}")
-        logger.info(f"\n=== Step 6: 固定 test slide = {args.test_slide} ===")
+            raise ValueError(f"--test_slide {args.test_slide} is not in loaded slides: {slides}")
+        logger.info(f"\n=== Step 6: Fixed test slide = {args.test_slide} ===")
         test_mask = adata_all.obs["slide_id"] == args.test_slide
         splits = [{
             "test_slide": args.test_slide,
@@ -431,7 +426,7 @@ def main():
         }]
         logger.info(f"train: {sum(~test_mask)} spots, test: {sum(test_mask)} spots")
     else:
-        logger.info("\n=== Step 6: 生成 leave-one-out splits ===")
+        logger.info("\n=== Step 6: Generate leave-one-slide-out splits ===")
         splits = []
         for test_slide in slides:
             test_mask = adata_all.obs["slide_id"] == test_slide
@@ -440,10 +435,9 @@ def main():
                 "train":      adata_all.obs_names[~test_mask].tolist(),
                 "test":       adata_all.obs_names[test_mask].tolist(),
             })
-        logger.info(f"生成 {len(splits)} 个 fold")
+        logger.info(f"Generated {len(splits)} folds")
 
-    # ── Step 7: 保存 ──
-    logger.info("\n=== Step 7: 保存 ===")
+    logger.info("\n=== Step 7: Save processed data ===")
     save_all(output_dir, adata_all, z_img_all, neighbor_map, splits, gene_list)
 
 

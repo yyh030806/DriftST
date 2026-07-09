@@ -1,20 +1,17 @@
-"""
-DriftST 训练脚本
+"""Training entry point for DriftST.
 
-变更：
-  1. 删除聚类（compute_clusters / IndexedDataset / cluster_ids）
-  2. 负样本 = dropout 预测存入 ring buffer，每次取 256 个
-  3. 正样本 = 唯一匹配的真实基因值（LN后），shape (B, 1, D)
-  4. K=16 次 dropout 采样；首次保留梯度，其余 detach 节省显存
-  5. [新增] wandb 记录 loss / PCC 曲线
+The training objective combines a ZINB reconstruction term with a one-step
+drifting loss. Stochastic dropout predictions are stored in a ring buffer and
+used as negative samples for the drift step; each spot's matched expression
+profile is used as the positive sample.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
-import wandb
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.dataset import build_datasets
@@ -23,17 +20,39 @@ from src.model import GenePredictor, zinb_loss
 from src.evaluation import evaluate
 
 
+class NullWandbRun:
+    def __init__(self):
+        self.summary = {}
 
 
-# ─────────────────────────────────────────────────────────────
-# Bank 预热
-# ─────────────────────────────────────────────────────────────
+class NullWandb:
+    """Small no-op logger with the subset of wandb used by this script."""
+
+    def __init__(self):
+        self.run = NullWandbRun()
+        self.config = self
+
+    def init(self, *args, **kwargs):
+        return self.run
+
+    def update(self, *args, **kwargs):
+        return None
+
+    def log(self, *args, **kwargs):
+        return None
+
+    def finish(self):
+        return None
+
+
+# -----------------------------------------------------------------------------
+# Bank warmup
+# -----------------------------------------------------------------------------
 
 @torch.no_grad()
 def capture_stochastic(model, loader, device, n_genes, K):
-    """dropout 开启、每个 spot 采样 K 次，汇成预测分布。
-    返回 (pred_samples (N*K, G), true (N, G))。用于可视化 DriftST 真正匹配的随机预测分布。"""
-    model.train()  # 开 dropout
+    """Collect K dropout samples per spot for distribution visualization."""
+    model.train()  # enable dropout
     preds, trues = [], []
     for batch in loader:
         img      = batch["z_img"].to(device)
@@ -50,10 +69,7 @@ def capture_stochastic(model, loader, device, n_genes, K):
 
 @torch.no_grad()
 def warmup_bank(model, loader, bank, device, K: int, min_samples: int):
-    """
-    用 K 次 dropout 前向填充 bank
-    保持 train 模式（dropout 需要激活以产生多样性）
-    """
+    """Fill the prediction bank with K dropout forwards per spot."""
     model.train()
     collected = 0
     for batch in loader:
@@ -72,21 +88,16 @@ def warmup_bank(model, loader, bank, device, K: int, min_samples: int):
         if collected >= min_samples:
             break
 
-    print(f"Bank 预热完成：{collected} 个样本 "
+    print(f"Bank warmup complete: collected {collected} samples "
           f"(bank.count={bank.total_count}/{bank.size})")
 
 
-# ─────────────────────────────────────────────────────────────
-# K 次 dropout 采样（显存节约版）
-# ─────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Memory-efficient K-sample dropout prediction
+# -----------------------------------------------------------------------------
 
 def sample_k_predictions(model, img, K: int, nb_img=None, nb_valid=None):
-    """
-    只有第一次前向保留梯度，其余 K-1 次 detach。
-    返回:
-      x0_k:      (B, K, n_genes)
-      gate_info: dict or None  来自第一次前向（有梯度的那次）
-    """
+    """Return K stochastic predictions, keeping gradients only for the first."""
     preds = []
 
     x0, gate_info = model(img, nb_img, nb_valid)
@@ -100,9 +111,9 @@ def sample_k_predictions(model, img, K: int, nb_img=None, nb_valid=None):
     return torch.cat(preds, dim=1), gate_info
 
 
-# ─────────────────────────────────────────────────────────────
-# 主训练函数
-# ─────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser()
@@ -118,20 +129,19 @@ def main():
     p.add_argument("--num_heads",        type=int,   default=8)
     p.add_argument("--dropout",          type=float, default=0.1)
     p.add_argument("--n_attn_layers",   type=int,   default=2,
-                   help="Bio-guided Attention 层数")
+                   help="number of bio-guided attention layers")
     p.add_argument("--use_gate",        action="store_true",
-                   help="启用 Progressive Gene Gating")
+                   help="enable progressive gene gating")
     p.add_argument("--gate_weight",     type=float, default=0.1,
-                   help="gate sparsity loss 的权重")
+                   help="weight of the gate sparsity loss")
     p.add_argument("--gate_targets",    type=float, nargs="+", default=None,
-                   help="每层目标保留率，如 0.8 0.5")
+                   help="target keep fractions per layer, e.g. 0.8 0.5")
     p.add_argument("--gate_entropy_weight", type=float, default=0.1,
-                   help="gate 熵正则权重，推动二值化")
+                   help="entropy regularization weight for sharper gates")
     p.add_argument("--std_weight",      type=float, default=0.0,
-                   help="std-matching loss 权重：每基因 (std(pred)-std(gt))^2 均值。"
-                        "默认 0（用 per-gene affine head 代替）")
+                   help="weight of per-gene std-matching loss; disabled by default")
     p.add_argument("--balance_slides",  action="store_true",
-                   help="按切片做均衡采样：每个切片在 epoch 内期望命中次数相等")
+                   help="balance sampling across training slides")
 
     p.add_argument("--epochs",           type=int,   default=100)
     p.add_argument("--t_max",            type=int,   default=None)
@@ -147,41 +157,46 @@ def main():
     p.add_argument("--bank_size",        type=int,   default=8192)
     p.add_argument("--bank_sample_size", type=int,   default=256)
     p.add_argument("--use_neighbor",    action="store_true",
-                   help="启用邻居空间聚合")
+                   help="enable spatial neighbor aggregation")
     p.add_argument("--max_neighbors",   type=int,   default=6)
 
-    # ── snapshot（用于训练过程可视化，默认关闭）───────────────
     p.add_argument("--snapshot_epochs", type=int, nargs="+", default=None,
-                   help="在这些 epoch 结束后保存 val 的 pred/true 基因表达矩阵到 snapshot_dir")
+                   help="epochs at which validation prediction snapshots are saved")
     p.add_argument("--snapshot_dir",    type=str, default=None,
-                   help="snapshot npz 保存目录")
+                   help="directory for snapshot npz files")
 
-    # ── wandb 相关参数 ──────────────────────────────────────
     p.add_argument("--wandb_project",    type=str,   default="DriftST")
     p.add_argument("--wandb_name",       type=str,   default=None,
-                   help="run 名称，默认为 fold-{fold}")
+                   help="run name; defaults to fold-{fold}")
     p.add_argument("--wandb_offline",    action="store_true",
-                   help="离线模式（服务器无网时使用）")
+                   help="use wandb offline mode")
+    p.add_argument("--no_wandb",         action="store_true",
+                   help="disable wandb logging")
 
     args = p.parse_args()
 
-    # ── 初始化 wandb ────────────────────────────────────────
-    if args.wandb_offline:
-        import os
-        os.environ["WANDB_MODE"] = "offline"
+    if args.no_wandb:
+        wandb = NullWandb()
+    else:
+        if args.wandb_offline:
+            os.environ["WANDB_MODE"] = "offline"
+        try:
+            import wandb
+        except ImportError:
+            print("[warn] wandb is not installed; logging is disabled.")
+            wandb = NullWandb()
 
     run_name = args.wandb_name or f"fold-{args.fold}"
     wandb.init(
         project = args.wandb_project,
         name    = run_name,
-        config  = vars(args),          # 自动记录所有超参数
+        config  = vars(args),
     )
 
     device  = torch.device(args.device)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 加载 SVG 排序（若存在）
     svg_indices = None
     svg_path = Path(args.data_dir) / "svg_ranking.json"
     if svg_path.exists():
@@ -191,24 +206,24 @@ def main():
             gene_names = json.load(f)
         gene2idx = {g: i for i, g in enumerate(gene_names)}
         svg_indices = [gene2idx[g] for g in svg_data["ranking"] if g in gene2idx]
-        print(f"SVG ranking 加载完成，共 {len(svg_indices)} 个基因 (来自 {svg_path.name})")
+        print(f"Loaded SVG ranking with {len(svg_indices)} genes from {svg_path.name}")
     else:
-        print("未找到 svg_ranking.json，跳过 SVG PCC 评估")
+        print("svg_ranking.json not found; SVG PCC metrics will be skipped")
 
     raw_train_ds, val_ds, meta = build_datasets(
-        data_dir=args.data_dir, fold=args.fold
+        data_dir=args.data_dir, fold=args.fold, max_neighbors=args.max_neighbors
     )
 
     data_n_genes = meta["n_genes"]
     if args.n_genes != data_n_genes:
         raise ValueError(
-            f"[n_genes 不匹配] --n_genes={args.n_genes} 但数据实际有 "
-            f"{data_n_genes} 个基因。请将 --n_genes 改为 {data_n_genes}。"
+            f"[n_genes mismatch] --n_genes={args.n_genes}, but the data contain "
+            f"{data_n_genes} genes. Please set --n_genes to {data_n_genes}."
         )
     n_genes    = data_n_genes
     test_slide = meta["test_slide"]
 
-    print(f"数据信息: n_genes={n_genes}, test_slide={test_slide}, "
+    print(f"Dataset: n_genes={n_genes}, test_slide={test_slide}, "
           f"n_train={meta['n_train']}, n_test={meta['n_test']}")
 
     if args.balance_slides:
@@ -218,8 +233,8 @@ def main():
         sampler = WeightedRandomSampler(
             sample_weights, num_samples=len(raw_train_ds), replacement=True,
         )
-        print(f"启用切片均衡采样: {len(slide_counts)} 个切片, "
-              f"spot 数 min={min(slide_counts.values())}, max={max(slide_counts.values())}")
+        print(f"Using slide-balanced sampling across {len(slide_counts)} slides; "
+              f"spot count min={min(slide_counts.values())}, max={max(slide_counts.values())}")
         train_loader = DataLoader(
             raw_train_ds, batch_size=args.batch_size, sampler=sampler,
             num_workers=args.num_workers, drop_last=True,
@@ -249,20 +264,18 @@ def main():
         max_neighbors = args.max_neighbors,
     ).to(device)
 
-    # ── 计算基因调控关系矩阵（Pearson 相关）并加载 ─────────
-    print("计算基因共表达矩阵（Pearson 相关）...")
-    # 直接读常驻内存的 gene_expr，避开邻居 mmap 读
+    print("Computing the gene co-expression matrix (Pearson correlation)...")
     train_expr = (raw_train_ds.gene_expr.numpy()
                   if hasattr(raw_train_ds.gene_expr, "numpy")
-                  else np.asarray(raw_train_ds.gene_expr))   # (N_train, n_genes)
-    R = np.corrcoef(train_expr.T)                           # (n_genes, n_genes)
-    R = np.nan_to_num(R, nan=0.0)                           # 处理常量基因
+                  else np.asarray(raw_train_ds.gene_expr))
+    R = np.corrcoef(train_expr.T)
+    R = np.nan_to_num(R, nan=0.0)
     model.load_bio_bias(R)
-    print(f"共表达矩阵加载完成，shape={R.shape}, "
+    print(f"Loaded co-expression matrix, shape={R.shape}, "
           f"mean={R.mean():.4f}, nonzero={np.count_nonzero(np.abs(R) > 0.3)}")
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"模型参数量：{total_params / 1e6:.2f}M")
+    print(f"Trainable parameters: {total_params / 1e6:.2f}M")
     wandb.config.update({"total_params_M": total_params / 1e6}, allow_val_change=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -282,9 +295,10 @@ def main():
     )
 
     best_pcc = -1.0
+    best_loss = float("inf")
 
     def std_match_loss(pred, gt):
-        """每个基因 batch 内 std 的 MSE。缓解 MSE 训练带来的均值回归。"""
+        """MSE between per-gene batch standard deviations."""
         return ((pred.std(dim=0) - gt.std(dim=0)) ** 2).mean()
 
     for epoch in range(args.epochs):
@@ -298,7 +312,8 @@ def main():
 
         if epoch == args.warm_epochs:
             best_pcc = -1.0
-            print("Drift 启动")
+            best_loss = float("inf")
+            print("Starting the drift phase")
 
         for batch in train_loader:
             img      = batch["z_img"].to(device)
@@ -318,14 +333,13 @@ def main():
                     loss   = loss + args.std_weight * s_loss
                     std_loss_acc += s_loss.item()
 
-                # gate sparsity loss
                 if gate_info is not None:
                     g_loss = gate_info.get('gate_sparsity_loss')
                     if g_loss is not None:
                         loss = loss + args.gate_weight * g_loss
                         gate_loss_acc += g_loss.item()
 
-                # warmup 阶段也填充 bank
+                # Keep the bank populated during warmup.
                 with torch.no_grad():
                     preds = [model(img, nb_img, nb_valid)[0] for _ in range(args.gen_per_spot)]
                     x0_k_w = torch.stack(preds, dim=1)
@@ -335,16 +349,13 @@ def main():
                 K    = args.gen_per_spot
                 x0_k, gate_info = sample_k_predictions(model, img, K, nb_img, nb_valid)  # (B, K, n_genes)
 
-                # ZINB 重建 loss：基于第一个（带梯度的）预测
                 recon_loss = zinb_loss(g_counts, x0_k[:, 0, :],
                                        gate_info["zinb_theta"], gate_info["zinb_pi_logits"])
 
-                # 正样本：唯一匹配，原始空间 (B, 1, D)
                 pos = g_true.detach().unsqueeze(1)
 
-                # 负样本：从 bank 取 256 个原始预测，所有 batch element 共享
-                neg_bank = bank.sample(args.bank_sample_size, device)         # (256, D)
-                neg_bank = neg_bank.unsqueeze(0).expand(B, -1, -1)            # (B, 256, D)
+                neg_bank = bank.sample(args.bank_sample_size, device)
+                neg_bank = neg_bank.unsqueeze(0).expand(B, -1, -1)
 
                 goal, goal_scaled, scale_inp = multi_scale_drift_step(
                     x      = x0_k,
@@ -362,7 +373,6 @@ def main():
                     loss   = loss + args.std_weight * s_loss
                     std_loss_acc += s_loss.item()
 
-                # gate sparsity loss
                 if gate_info is not None:
                     g_loss = gate_info.get('gate_sparsity_loss')
                     if g_loss is not None:
@@ -372,11 +382,10 @@ def main():
                 drift_loss_acc += d_loss.item()
                 zinb_loss_acc  += recon_loss.item()
 
-                # bank 更新：本批次 B*K 个原始预测全部 enqueue
                 bank.enqueue(x0_k.detach().reshape(-1, n_genes))
 
             if not torch.isfinite(loss):
-                print("[防御] NaN/Inf，跳过 batch")
+                print("[warn] NaN/Inf loss detected; skipping this batch")
                 optimizer.zero_grad()
                 continue
 
@@ -392,37 +401,33 @@ def main():
         train_loss /= n_batches
         current_lr  = scheduler.get_last_lr()[0]
 
-        # evaluate 返回 12 个指标
         val_pcc, val_pcc10, val_pcc50, val_pcc200, \
             pred_mean, pred_std, true_mean, true_std, \
             val_mse, val_mae, svg_pcc20, svg_pcc50 = evaluate(
             model, val_loader, n_genes, device, svg_indices=svg_indices
         )
 
-        # ── snapshot：保存 val 的 pred/true 用于训练过程可视化 ──
         if args.snapshot_epochs is not None and epoch in args.snapshot_epochs:
             snap_dir = Path(args.snapshot_dir or (out_dir / "snapshots"))
             snap_dir.mkdir(parents=True, exist_ok=True)
-            # 确定性点预测（条件均值，参考用）
             *_, snap_pred_det, snap_true = evaluate(
                 model, val_loader, n_genes, device,
                 svg_indices=svg_indices, return_predictions=True,
             )
-            # 随机(dropout 采样)预测分布 —— DriftST 真正匹配 target 的分布
             snap_pred_stoch, _ = capture_stochastic(
                 model, val_loader, device, n_genes, K=args.gen_per_spot,
             )
             d_now = (drift_loss_acc / max(1, len(train_loader))) if not is_warmup else float("nan")
             np.savez_compressed(
                 snap_dir / f"snapshot_epoch{epoch:03d}.npz",
-                pred=snap_pred_stoch.astype(np.float32),     # 随机采样分布(默认画这个)
-                pred_det=snap_pred_det.astype(np.float32),   # 确定性均值(参考)
+                pred=snap_pred_stoch.astype(np.float32),
+                pred_det=snap_pred_det.astype(np.float32),
                 true=snap_true.astype(np.float32),
                 epoch=epoch,
                 drift_loss=d_now,
                 train_loss=train_loss,
             )
-            model.train()  # capture 后恢复 train 模式
+            model.train()
             print(f"[snapshot] saved epoch {epoch} -> {snap_dir}")
 
         phase = "warm " if is_warmup else "drift"
@@ -502,11 +507,21 @@ def main():
                 "args":       vars(args),
             }, out_dir / "best_model.pt")
 
-            # 在 wandb 里标记最佳 checkpoint
             wandb.run.summary["best_val_pcc"]   = best_pcc
             wandb.run.summary["best_epoch"]      = epoch
 
-    print(f"Fold {args.fold} 训练结束，最佳 PCC: {best_pcc:.4f}")
+        def _ckpt():
+            return {"state_dict": model.state_dict(), "val_pcc": val_pcc,
+                    "train_loss": train_loss, "epoch": epoch, "fold": args.fold,
+                    "test_slide": test_slide, "args": vars(args)}
+        if not is_warmup and train_loss < best_loss:
+            best_loss = train_loss
+            torch.save(_ckpt(), out_dir / "min_loss_model.pt")
+            wandb.run.summary["min_loss"]       = best_loss
+            wandb.run.summary["min_loss_epoch"] = epoch
+        torch.save(_ckpt(), out_dir / "last_model.pt")
+
+    print(f"Fold {args.fold} finished. Best PCC: {best_pcc:.4f} | Min loss: {best_loss:.4f}")
     wandb.finish()
 
 

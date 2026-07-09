@@ -1,11 +1,9 @@
-"""
-dataset.py
+"""Dataset utilities for preprocessed DriftST data.
 
-支持图像增强：
-  z_img_features.npy 可以是 (N, D) 或 (N, n_versions, D)
-  - 2D: 旧格式，直接使用
-  - 3D: 增强格式，index 0 = 原始，index 1.. = 增强版本
-        训练时随机选一个版本，评估时用 index 0（原始）
+``z_img_features.npy`` may be stored as either ``(N, D)`` or
+``(N, n_versions, D)``. The 3D format stores the original feature at index 0
+and augmented versions at later indices; training samples one version at random
+while evaluation always uses the original feature.
 """
 
 import json
@@ -24,7 +22,7 @@ class SpatialDataset(Dataset):
         data_dir      : directory produced by preprocess.py
         barcodes      : spot barcodes belonging to this split
         max_neighbors : maximum 1-hop neighbors to return (Visium: up to 6)
-        is_train      : True = 训练集（随机选增强版本），False = 测试集（只用原始）
+        is_train      : True samples augmented features; False uses originals.
     """
 
     def __init__(
@@ -38,13 +36,11 @@ class SpatialDataset(Dataset):
         self.max_neighbors = max_neighbors
         self.is_train      = is_train
 
-        # ── 全量数组：mmap 加载 ──────────────────────────────────────────────
         gene_mat  = np.load(self.data_dir / "gene_expression.npy", mmap_mode='r')  # (N, G)
         z_img_raw = np.load(self.data_dir / "z_img_features.npy",  mmap_mode='r')
 
-        # 检测特征格式：2D (N, D) 或 3D (N, n_versions, D)
         if z_img_raw.ndim == 3:
-            self.n_versions = z_img_raw.shape[1]   # 1 + n_aug
+            self.n_versions = z_img_raw.shape[1]
             self.feat_dim   = z_img_raw.shape[2]
             self.has_aug    = True
         else:
@@ -59,7 +55,6 @@ class SpatialDataset(Dataset):
 
         bc2idx = {bc: i for i, bc in enumerate(all_barcodes)}
 
-        # ── 过滤当前 split 的 barcode ────────────────────────────────────────
         valid_bcs = [bc for bc in barcodes if bc in bc2idx]
         idxs      = [bc2idx[bc] for bc in valid_bcs]
 
@@ -67,30 +62,24 @@ class SpatialDataset(Dataset):
         self.n_spots   = len(valid_bcs)
         self.n_genes   = gene_mat.shape[1]
 
-        # 原始 count（ZINB loss 用，常驻内存）
-        self.gene_counts = torch.tensor(gene_mat[idxs], dtype=torch.float32)  # (N_split, G)
-        # 基因表达（log1p 归一化，drift / 评估 用，常驻内存）
-        self.gene_expr = torch.log1p(self.gene_counts)  # (N_split, G)
+        self.gene_counts = torch.tensor(gene_mat[idxs], dtype=torch.float32)
+        self.gene_expr = torch.log1p(self.gene_counts)
 
-        # 图像特征（常驻内存）
         if self.has_aug:
-            # 3D: (N_split, n_versions, D)
             self.z_img = torch.tensor(
                 z_img_raw[idxs], dtype=torch.float32
-            )  # (N_split, n_versions, D)
+            )
         else:
-            # 2D: (N_split, D) → 兼容旧格式
             self.z_img = torch.tensor(
                 z_img_raw[idxs], dtype=torch.float32
-            )  # (N_split, D)
+            )
 
-        # 全量数组保留引用，供邻居索引用（mmap，不复制）
+        # Keep the full mmap array for neighbor feature lookup.
         self._all_zimg = z_img_raw
 
         # slide_id
         self.slide_ids = self._parse_slide_ids(valid_bcs, self.data_dir)
 
-        # ── 预计算邻居索引矩阵 ────────────────────────────────────────────────
         K = max_neighbors
         self.neighbor_idxs = torch.full(
             (self.n_spots, K), fill_value=-1, dtype=torch.long
@@ -100,8 +89,6 @@ class SpatialDataset(Dataset):
             for k, nbc in enumerate(nbs[:K]):
                 if nbc in bc2idx:
                     self.neighbor_idxs[i, k] = bc2idx[nbc]
-
-    # ── 辅助：解析 slide_id ───────────────────────────────────────────────────
 
     @staticmethod
     def _parse_slide_ids(barcodes: list[str], data_dir: Path) -> list[str]:
@@ -119,28 +106,24 @@ class SpatialDataset(Dataset):
             slide_ids.append(parts[0] if len(parts) == 2 else "unknown")
         return slide_ids
 
-    # ── Dataset 接口 ──────────────────────────────────────────────────────────
-
     def __len__(self) -> int:
         return self.n_spots
 
     def __getitem__(self, idx: int) -> dict:
         gene_expr = self.gene_expr[idx]   # (G,)
 
-        # ── 图像特征：训练时随机选增强版本，评估时用原始 ──
         if self.has_aug:
             if self.is_train:
                 aug_idx = random.randint(0, self.n_versions - 1)
             else:
-                aug_idx = 0  # 评估时只用原始
-            z_img = self.z_img[idx, aug_idx]    # (D,)
+                aug_idx = 0
+            z_img = self.z_img[idx, aug_idx]
         else:
-            z_img = self.z_img[idx]             # (D,) 旧格式兼容
+            z_img = self.z_img[idx]
 
         K = self.max_neighbors
         D = self.feat_dim
 
-        # 邻居
         nidxs = self.neighbor_idxs[idx]
         valid = nidxs >= 0
 
@@ -148,7 +131,6 @@ class SpatialDataset(Dataset):
 
         if valid.any():
             valid_nidxs = nidxs[valid].numpy()
-            # 邻居特征：训练时随机选增强版本，评估时用原始
             if self.has_aug:
                 nb_aug_idx = aug_idx if self.is_train else 0
                 neighbor_zimg[valid] = torch.tensor(
@@ -169,8 +151,6 @@ class SpatialDataset(Dataset):
             "barcode":          self.barcodes[idx],
         }
 
-
-# ── 构建 train/test split ─────────────────────────────────────────────────────
 
 def build_datasets(
     data_dir:      str,
