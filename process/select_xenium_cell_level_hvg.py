@@ -14,7 +14,7 @@ def parse_args():
     p.add_argument("--transcripts", required=True,
                    help="path to one *_transcripts.parquet file")
     p.add_argument("--candidate_genes", required=True,
-                   help="candidate gene list produced by select_xenium_genes.py")
+                   help="candidate gene list produced by select_xenium_cell_level_genes.py")
     p.add_argument("--out_file", required=True)
     p.add_argument("--n_top_genes", type=int, default=280)
     p.add_argument("--qv_threshold", type=float, default=20.0)

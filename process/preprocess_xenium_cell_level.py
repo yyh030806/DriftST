@@ -1,4 +1,4 @@
-"""Preprocess HEST Xenium data for DriftST.
+"""Preprocess Xenium cell-level data for DriftST.
 
 This script reconstructs a cell-by-gene count matrix from transcript parquet
 files, extracts UNI2+CONCH H&E patch features, builds a spatial neighbor map,

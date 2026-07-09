@@ -14,11 +14,11 @@ DEVICE="${DEVICE:-cuda}"
 
 mkdir -p "${OUTPUT_DIR}"
 
-"${PYTHON}" "${REPO_DIR}/process/select_xenium_genes.py" \
+"${PYTHON}" "${REPO_DIR}/process/select_xenium_cell_level_genes.py" \
     --transcripts_dir "${XENIUM_DIR}/transcripts" \
     --out_file "${GENE_LIST}"
 
-"${PYTHON}" "${REPO_DIR}/process/preprocess_xenium.py" \
+"${PYTHON}" "${REPO_DIR}/process/preprocess_xenium_cell_level.py" \
     --data_dir "${XENIUM_DIR}" \
     --output_dir "${OUTPUT_DIR}" \
     --gene_list "${GENE_LIST}" \

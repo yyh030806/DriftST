@@ -57,7 +57,7 @@ FOLD_DIR="${EXP_DIR}/fold_${FOLD}"
 mkdir -p "${FOLD_DIR}"
 
 if [[ "${SKIP_PREPROCESS}" == false ]]; then
-    "${PYTHON}" "${REPO_DIR}/process/preprocess.py" \
+    "${PYTHON}" "${REPO_DIR}/process/preprocess_spot_level.py" \
         --data_dir "${DATA_DIR}" \
         --output_dir "${OUTPUT_DIR}" \
         --gene_list "${GENE_LIST}"

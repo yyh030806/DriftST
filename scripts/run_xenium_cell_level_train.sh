@@ -58,7 +58,7 @@ hr() { echo "======================================================="; }
 SVG_FILE="${OUTPUT_DIR}/svg_ranking.json"
 if [[ ! -f "${SVG_FILE}" ]]; then
     log "Computing SVG ranking with Moran's I..."
-    "${PYTHON}" "${REPO_DIR}/process/compute_svg.py" --data_dir "${OUTPUT_DIR}" --slide "${SVG_SLIDE}"
+    "${PYTHON}" "${REPO_DIR}/process/compute_spatial_variable_genes.py" --data_dir "${OUTPUT_DIR}" --slide "${SVG_SLIDE}"
 else
     log "Using existing SVG ranking: ${SVG_FILE}"
 fi

@@ -19,8 +19,8 @@ class SpatialDataset(Dataset):
     Single-split (train or test) spatial transcriptomics dataset.
 
     Args:
-        data_dir      : directory produced by preprocess.py
-        barcodes      : spot barcodes belonging to this split
+        data_dir      : processed_data directory produced by preprocessing
+        barcodes      : cell or spot barcodes belonging to this split
         max_neighbors : maximum 1-hop neighbors to return (Visium: up to 6)
         is_train      : True samples augmented features; False uses originals.
     """
