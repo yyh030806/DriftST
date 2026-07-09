@@ -1,19 +1,21 @@
-anndata
-numpy
-pandas
-pillow
-safetensors
-scanpy
-scikit-learn
-scipy
-squidpy
-tifffile
-timm
-torch
-torchvision
-tqdm
-wandb
+# Core dependencies pinned from the local DriftST conda environment.
+# Python: 3.10.20
 
-# CONCH is required for preprocessing. Install it from the official CONCH
-# repository/environment used by your institution, so that
-# `conch.open_clip_custom` is importable.
+anndata==0.11.4
+conch @ git+https://github.com/mahmoodlab/CONCH.git@141cc09c7d4ff33d8eda562bd75169b457f71a62
+numpy==2.2.6
+pandas==2.3.3
+pillow==12.0.0
+pyarrow==23.0.1
+safetensors==0.7.0
+scanpy==1.11.5
+scikit-learn==1.7.2
+scikit-misc==0.5.2
+scipy==1.15.3
+squidpy==1.6.5
+tifffile==2025.5.10
+timm==1.0.25
+torch==2.5.1
+torchvision==0.20.1
+tqdm==4.67.3
+wandb==0.25.1

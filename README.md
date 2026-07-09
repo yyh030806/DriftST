@@ -40,15 +40,20 @@ DriftST/
 
 ## Installation
 
-Create a Python environment with PyTorch and install the package dependencies:
+The dependency versions in this repository are pinned from the development
+`DriftST` conda environment (`Python 3.10.20`). You can create a matching
+environment with:
+
+```bash
+conda env create -f environment.yml
+conda activate DriftST
+```
+
+Alternatively, install the Python dependencies into an existing environment:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-CONCH is not distributed through this repository. Install the CONCH package in
-the same environment so that `conch.open_clip_custom` is importable before
-running preprocessing.
 
 The preprocessing scripts expect local UNI2 and CONCH checkpoints under:
 
