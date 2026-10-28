@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data and caches
+data/
+processed/
+hest1k_datasets/
+*.npy
+*.npz
+*.pt
+*.tif
+*.tiff
+*.h5ad
+*.parquet
+*.geojson
+*.zip
+
+# Training artifacts
+weights/
+experiments/
+wandb/
+snapshots*/
+
+# Logs and local reports
+*.log
+view-*.pdf
+color.png
+
+# Local analysis outputs not part of the public code release
+archive/
+comparison/
+eval/
+plotting/
+build_ghist_hest_frame.py
+build_ghist_hest_realnuc.py
+extract_resnet18_features.py
+train_ablation_feature.py
+scripts/run_coad_ablation_*.sh
+
+# IDE
+.vscode/
+.idea/
+.claude/

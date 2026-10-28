@@ -1,0 +1,141 @@
+"""Evaluation helpers for per-gene PCC, SVG-PCC, and log2-space errors."""
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from scipy.stats import pearsonr
+
+
+def load_svg_indices(data_dir, fold, train_sha256, path=None, data_sha256=None):
+    """Load only rankings whose provenance matches this fold's training set."""
+    data_dir = Path(data_dir)
+    ranking_path = Path(path) if path else data_dir / f"svg_ranking_fold{fold}.json"
+    if not ranking_path.exists():
+        if path:
+            raise FileNotFoundError(f"SVG ranking not found: {ranking_path}")
+        print(f"{ranking_path.name} not found; SVG PCC metrics will be skipped")
+        return None
+    with open(ranking_path) as f:
+        svg_data = json.load(f)
+    if svg_data.get("training_split_sha256") != train_sha256:
+        raise ValueError(f"SVG ranking {ranking_path} does not match the training split")
+    if data_sha256 is not None and svg_data.get("data_sha256") != data_sha256:
+        raise ValueError(f"SVG ranking {ranking_path} does not match the processed data")
+    with open(data_dir / "gene_names.json") as f:
+        gene_names = json.load(f)
+    gene2idx = {gene: i for i, gene in enumerate(gene_names)}
+    indices = [gene2idx[g] for g in svg_data["ranking"] if g in gene2idx]
+    print(f"Loaded training-only SVG ranking with {len(indices)} genes from {ranking_path}")
+    return indices
+
+
+def metrics_from_arrays(all_pred, all_true, n_genes, svg_indices=None, verbose=True):
+    """Compute the same metric tuple as ``evaluate`` from numpy arrays."""
+    all_pred = np.asarray(all_pred)
+    all_true = np.asarray(all_true)
+
+    gene_pccs = []
+    for i in range(n_genes):
+        if all_pred[:, i].std() < 1e-8 or all_true[:, i].std() < 1e-8:
+            gene_pccs.append(0.0)
+            continue
+        pcc, _ = pearsonr(all_pred[:, i], all_true[:, i])
+        gene_pccs.append(float(pcc) if not np.isnan(pcc) else 0.0)
+
+    pred_mean, pred_std = float(all_pred.mean()), float(all_pred.std())
+    true_mean, true_std = float(all_true.mean()), float(all_true.std())
+
+    pccs_sorted = sorted(gene_pccs, reverse=True)
+    pcc_10  = np.mean(pccs_sorted[:10])
+    pcc_50  = np.mean(pccs_sorted[:min(50,  len(pccs_sorted))])
+    pcc_200 = np.mean(pccs_sorted[:min(200, len(pccs_sorted))])
+    pcc_all = np.mean(gene_pccs)
+    ln2 = np.log(2)
+    mse_log2 = float(np.mean(((all_pred - all_true) / ln2) ** 2))
+    mae_log2 = float(np.mean(np.abs((all_pred - all_true) / ln2)))
+
+    svg_pcc20, svg_pcc50 = float("nan"), float("nan")
+    if svg_indices is not None and len(svg_indices) > 0:
+        svg_pccs = [gene_pccs[i] for i in svg_indices if i < n_genes]
+        svg_pcc20 = float(np.mean(svg_pccs[:20]))
+        svg_pcc50 = float(np.mean(svg_pccs[:min(50, len(svg_pccs))]))
+
+    if verbose:
+        print(f"PCC-10={pcc_10:.4f} | PCC-50={pcc_50:.4f} | "
+              f"PCC-200={pcc_200:.4f} | PCC-all={pcc_all:.4f} | "
+              f"SVG-20={svg_pcc20:.4f} | SVG-50={svg_pcc50:.4f}")
+    return (pcc_all, pcc_10, pcc_50, pcc_200,
+            pred_mean, pred_std, true_mean, true_std,
+            mse_log2, mae_log2, svg_pcc20, svg_pcc50)
+
+
+@torch.no_grad()
+def evaluate(model, loader, n_genes, device, svg_indices=None, return_predictions=False,
+             clip_nonnegative=False):
+    """
+    svg_indices: list of gene indices sorted by Moran's I (descending).
+                 If provided, reports PCC for top-20 and top-50 SVGs.
+    return_predictions: if True, append ``(all_pred, all_true)`` arrays.
+    clip_nonnegative: if True, clamp predictions to zero before metrics/results.
+    """
+    model.eval()
+    all_pred, all_true = [], []
+
+    for batch in loader:
+        img      = batch["z_img"].to(device)
+        g_true   = batch["gene_expr"].to(device)
+        nb_img   = batch["neighbor_zimg"].to(device)
+        nb_valid = batch["neighbor_valid"].to(device)
+
+        x0, _ = model(img, nb_img, nb_valid)
+        all_pred.append(x0.cpu().numpy())
+        all_true.append(g_true.cpu().numpy())
+
+    all_pred = np.concatenate(all_pred, axis=0)
+    all_true = np.concatenate(all_true, axis=0)
+    if clip_nonnegative:
+        all_pred = np.maximum(all_pred, 0.0)
+
+    print(f"pred mean={all_pred.mean():.4f}, std={all_pred.std():.4f}")
+    print(f"true mean={all_true.mean():.4f}, std={all_true.std():.4f}")
+
+    gene_pccs = []
+    for i in range(n_genes):
+        pcc, _ = pearsonr(all_pred[:, i], all_true[:, i])
+        gene_pccs.append(float(pcc) if not np.isnan(pcc) else 0.0)
+
+    pred_mean = float(all_pred.mean())
+    pred_std  = float(all_pred.std())
+    true_mean = float(all_true.mean())
+    true_std  = float(all_true.std())
+
+    if not any(p != 0.0 for p in gene_pccs):
+        svg_value = 0.0 if svg_indices else float("nan")
+        result = (0.0, 0.0, 0.0, 0.0, pred_mean, pred_std, true_mean, true_std,
+                  0.0, 0.0, svg_value, svg_value)
+        return (*result, all_pred, all_true) if return_predictions else result
+
+    pccs_sorted = sorted(gene_pccs, reverse=True)
+    pcc_10  = np.mean(pccs_sorted[:10])
+    pcc_50  = np.mean(pccs_sorted[:min(50,  len(pccs_sorted))])
+    pcc_200 = np.mean(pccs_sorted[:min(200, len(pccs_sorted))])
+    pcc_all = np.mean(gene_pccs)
+    ln2 = np.log(2)
+    mse_log2 = float(np.mean(((all_pred - all_true) / ln2) ** 2))
+    mae_log2 = float(np.mean(np.abs((all_pred - all_true) / ln2)))
+
+    # SVG PCC for top genes ranked by Moran's I.
+    svg_pcc20, svg_pcc50 = float("nan"), float("nan")
+    if svg_indices is not None and len(svg_indices) > 0:
+        svg_pccs = [gene_pccs[i] for i in svg_indices if i < n_genes]
+        svg_pcc20 = float(np.mean(svg_pccs[:20]))
+        svg_pcc50 = float(np.mean(svg_pccs[:min(50, len(svg_pccs))]))
+
+    print(f"PCC-10={pcc_10:.4f} | PCC-50={pcc_50:.4f} | "
+          f"PCC-200={pcc_200:.4f} | PCC-all={pcc_all:.4f} | "
+          f"SVG-20={svg_pcc20:.4f} | SVG-50={svg_pcc50:.4f}")
+    result = (pcc_all, pcc_10, pcc_50, pcc_200,
+              pred_mean, pred_std, true_mean, true_std,
+              mse_log2, mae_log2, svg_pcc20, svg_pcc50)
+    return (*result, all_pred, all_true) if return_predictions else result
